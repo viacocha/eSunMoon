@@ -31,16 +31,23 @@ type nominatimPlace struct {
 	DisplayName string `json:"display_name"`
 }
 
+// 每日天文数据（既有人类可读字符串，也有数值字段，方便 chart）
 type dailyAstro struct {
-	Date          string `json:"date"`
-	Sunrise       string `json:"sunrise"`
-	Sunset        string `json:"sunset"`
-	SolarNoon     string `json:"solar_noon"`
-	MaxAltitude   string `json:"max_altitude_deg"`
-	DayLength     string `json:"day_length_hhmm"`
-	Moonrise      string `json:"moonrise"`
-	Moonset       string `json:"moonset"`
-	MoonIllumFrac string `json:"moon_illumination"`
+	Date string `json:"date"`
+
+	Sunrise   string `json:"sunrise"`
+	Sunset    string `json:"sunset"`
+	SolarNoon string `json:"solar_noon"`
+
+	MaxAltitude   string  `json:"max_altitude_deg"`
+	DayLength     string  `json:"day_length_hhmm"`
+	Moonrise      string  `json:"moonrise"`
+	Moonset       string  `json:"moonset"`
+	MoonIllumFrac string  `json:"moon_illumination"`
+
+	MaxAltitudeNum       float64 `json:"max_altitude_num,omitempty"`
+	DayLengthMinutes     int     `json:"day_length_minutes,omitempty"`
+	MoonIlluminationNum  float64 `json:"moon_illumination_num,omitempty"` // 0~1
 }
 
 type CityContext struct {
@@ -176,7 +183,8 @@ func geocodeCity(city string) (lat, lon float64, displayName string, err error) 
 	}
 	req.Header.Set("User-Agent", "eSunMoon/1.0 (contact: your-email@example.com)")
 
-	resp, err := http.DefaultClient.Do(req)
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
 	if err != nil {
 		return
 	}
@@ -236,34 +244,45 @@ func generateAstroData(cityName string, lat, lon float64, loc *time.Location, st
 		solarNoon := sunTimes[suncalc.SolarNoon].Value.In(loc)
 
 		maxAltitude := "--"
+		var maxAltitudeNum float64
 		if !solarNoon.IsZero() {
 			pos := suncalc.GetPosition(solarNoon, lat, lon)
 			maxAltDeg := radToDeg(pos.Altitude)
+			maxAltitudeNum = maxAltDeg
 			maxAltitude = fmt.Sprintf("%.2f", maxAltDeg)
 		}
 
 		dayLengthStr := "--"
+		dayLengthMinutes := 0
 		if !sunrise.IsZero() && !sunset.IsZero() {
 			dayLength := sunset.Sub(sunrise)
 			dayLengthStr = formatDuration(dayLength)
+			dayLengthMinutes = int(dayLength.Minutes())
 		}
 
 		moonTimes := suncalc.GetMoonTimes(day, lat, lon, false)
 		moonrise := moonTimes.Rise.In(loc)
 		moonset := moonTimes.Set.In(loc)
 		moonIllum := suncalc.GetMoonIllumination(day)
-		moonIllumPct := fmt.Sprintf("%.1f%%", moonIllum.Fraction*100)
+		moonIllumFrac := moonIllum.Fraction
+		moonIllumPct := fmt.Sprintf("%.1f%%", moonIllumFrac*100)
 
 		result = append(result, dailyAstro{
-			Date:          dayDateStr,
-			Sunrise:       formatTimeLocal(sunrise),
-			Sunset:        formatTimeLocal(sunset),
-			SolarNoon:     formatTimeLocal(solarNoon),
+			Date: dayDateStr,
+
+			Sunrise:   formatTimeLocal(sunrise),
+			Sunset:    formatTimeLocal(sunset),
+			SolarNoon: formatTimeLocal(solarNoon),
+
 			MaxAltitude:   maxAltitude,
 			DayLength:     dayLengthStr,
 			Moonrise:      formatTimeLocal(moonrise),
 			Moonset:       formatTimeLocal(moonset),
 			MoonIllumFrac: moonIllumPct,
+
+			MaxAltitudeNum:      maxAltitudeNum,
+			DayLengthMinutes:    dayLengthMinutes,
+			MoonIlluminationNum: moonIllumFrac,
 		})
 	}
 	return result, nil
@@ -304,7 +323,7 @@ func writeAstroTxt(cityName string, now time.Time, data []dailyAstro, desc, file
 	if desc != "" {
 		fmt.Fprintf(w, "# 范围：%s\n", desc)
 	}
-	fmt.Fprintln(w, "# 所有时间均为城市所在时区的当地时间。\n")
+	fmt.Fprintln(w, "# 所有时间均为城市所在时区的当地时间。")
 
 	fmt.Fprintln(w, "日期\t日出\t日落\t太阳最高时刻\t太阳最高高度(°)\t日照时长(hh:mm)\t月出\t月落\t月亮可见光比例")
 	for _, d := range data {
@@ -336,7 +355,13 @@ func writeAstroCSV(cityName string, now time.Time, data []dailyAstro, desc, file
 		_ = w.Write([]string{"range", desc})
 	}
 	_ = w.Write([]string{})
-	_ = w.Write([]string{"date", "sunrise", "sunset", "solar_noon", "max_altitude_deg", "day_length_hhmm", "moonrise", "moonset", "moon_illumination"})
+	_ = w.Write([]string{
+		"date", "sunrise", "sunset", "solar_noon",
+		"max_altitude_deg", "max_altitude_num",
+		"day_length_hhmm", "day_length_minutes",
+		"moonrise", "moonset",
+		"moon_illumination", "moon_illumination_num",
+	})
 
 	for _, d := range data {
 		_ = w.Write([]string{
@@ -345,10 +370,13 @@ func writeAstroCSV(cityName string, now time.Time, data []dailyAstro, desc, file
 			d.Sunset,
 			d.SolarNoon,
 			d.MaxAltitude,
+			fmt.Sprintf("%.4f", d.MaxAltitudeNum),
 			d.DayLength,
+			strconv.Itoa(d.DayLengthMinutes),
 			d.Moonrise,
 			d.Moonset,
 			d.MoonIllumFrac,
+			fmt.Sprintf("%.4f", d.MoonIlluminationNum),
 		})
 	}
 	w.Flush()
@@ -398,7 +426,14 @@ func writeAstroExcel(cityName string, now time.Time, data []dailyAstro, desc, fi
 	f.SetCellValue(sheet, "A4", "提示")
 	f.SetCellValue(sheet, "B4", "所有时间均为城市所在时区的当地时间")
 
-	headers := []string{"日期", "日出", "日落", "太阳最高时刻", "太阳最高高度(°)", "日照时长(hh:mm)", "月出", "月落", "月亮可见光比例"}
+	headers := []string{
+		"日期",
+		"日出", "日落", "太阳最高时刻",
+		"太阳最高高度(°)", "最高高度数值",
+		"日照时长(hh:mm)", "日照时长(分钟)",
+		"月出", "月落",
+		"月亮可见光比例", "月亮光照数值",
+	}
 	for i, h := range headers {
 		cell, _ := excelize.CoordinatesToCellName(i+1, 6)
 		f.SetCellValue(sheet, cell, h)
@@ -407,9 +442,12 @@ func writeAstroExcel(cityName string, now time.Time, data []dailyAstro, desc, fi
 	row := 7
 	for _, d := range data {
 		values := []interface{}{
-			d.Date, d.Sunrise, d.Sunset, d.SolarNoon,
-			d.MaxAltitude, d.DayLength,
-			d.Moonrise, d.Moonset, d.MoonIllumFrac,
+			d.Date,
+			d.Sunrise, d.Sunset, d.SolarNoon,
+			d.MaxAltitude, d.MaxAltitudeNum,
+			d.DayLength, d.DayLengthMinutes,
+			d.Moonrise, d.Moonset,
+			d.MoonIllumFrac, d.MoonIlluminationNum,
 		}
 		for col, v := range values {
 			cell, _ := excelize.CoordinatesToCellName(col+1, row)
@@ -557,16 +595,60 @@ func sanitizeFileName(name string) string {
 	return name
 }
 
-// -------------------- 三种模式业务入口 --------------------
+// -------------------- 三种模式业务入口（CLI+HTTP 共用） --------------------
+
+func buildYearData(ctx *CityContext) (data []dailyAstro, desc, baseName string, err error) {
+	start := time.Date(ctx.Now.Year(), ctx.Now.Month(), ctx.Now.Day(), 12, 0, 0, 0, ctx.Loc)
+	data, err = generateAstroData(ctx.City, ctx.Lat, ctx.Lon, ctx.Loc, start, 365)
+	if err != nil {
+		return nil, "", "", fmt.Errorf("生成年度天文数据失败: %w", err)
+	}
+	desc = fmt.Sprintf("从 %s 起连续 365 天", start.Format("2006-01-02"))
+	baseName = fmt.Sprintf("%s-%s-year", sanitizeFileName(ctx.City), ctx.Now.Format("2006-01-02"))
+	return
+}
+
+func buildDayData(ctx *CityContext, dateStr string) (data []dailyAstro, desc, baseName string, err error) {
+	day, err := parseDateInLocation(dateStr, ctx.Loc)
+	if err != nil {
+		return nil, "", "", fmt.Errorf("解析日期失败（格式应为 YYYY-MM-DD）: %w", err)
+	}
+	data, err = generateAstroData(ctx.City, ctx.Lat, ctx.Lon, ctx.Loc, day, 1)
+	if err != nil {
+		return nil, "", "", fmt.Errorf("生成指定日期天文数据失败: %w", err)
+	}
+	desc = fmt.Sprintf("指定日期：%s", day.Format("2006-01-02"))
+	baseName = fmt.Sprintf("%s-%s", sanitizeFileName(ctx.City), day.Format("2006-01-02"))
+	return
+}
+
+func buildRangeData(ctx *CityContext, fromStr, toStr string) (data []dailyAstro, desc, baseName string, err error) {
+	start, err := parseDateInLocation(fromStr, ctx.Loc)
+	if err != nil {
+		return nil, "", "", fmt.Errorf("解析起始日期失败（格式应为 YYYY-MM-DD）: %w", err)
+	}
+	end, err := parseDateInLocation(toStr, ctx.Loc)
+	if err != nil {
+		return nil, "", "", fmt.Errorf("解析结束日期失败（格式应为 YYYY-MM-DD）: %w", err)
+	}
+	if end.Before(start) {
+		return nil, "", "", fmt.Errorf("结束日期不能早于起始日期")
+	}
+	days := int(end.Sub(start).Hours()/24) + 1
+	data, err = generateAstroData(ctx.City, ctx.Lat, ctx.Lon, ctx.Loc, start, days)
+	if err != nil {
+		return nil, "", "", fmt.Errorf("生成区间天文数据失败: %w", err)
+	}
+	desc = fmt.Sprintf("日期区间：%s ~ %s，共 %d 天", start.Format("2006-01-02"), end.Format("2006-01-02"), days)
+	baseName = fmt.Sprintf("%s-%s_to_%s", sanitizeFileName(ctx.City), start.Format("2006-01-02"), end.Format("2006-01-02"))
+	return
+}
 
 func runYear(ctx *CityContext) error {
-	start := time.Date(ctx.Now.Year(), ctx.Now.Month(), ctx.Now.Day(), 12, 0, 0, 0, ctx.Loc)
-	data, err := generateAstroData(ctx.City, ctx.Lat, ctx.Lon, ctx.Loc, start, 365)
+	data, desc, baseName, err := buildYearData(ctx)
 	if err != nil {
-		return fmt.Errorf("生成年度天文数据失败: %w", err)
+		return err
 	}
-	desc := fmt.Sprintf("从 %s 起连续 365 天", start.Format("2006-01-02"))
-	baseName := fmt.Sprintf("%s-%s-year", sanitizeFileName(ctx.City), ctx.Now.Format("2006-01-02"))
 	outFile, err := writeAstroFile(ctx.City, ctx.Now, data, desc, baseName)
 	if err != nil {
 		return fmt.Errorf("写入文件失败: %w", err)
@@ -576,16 +658,10 @@ func runYear(ctx *CityContext) error {
 }
 
 func runDay(ctx *CityContext, dateStr string) error {
-	day, err := parseDateInLocation(dateStr, ctx.Loc)
+	data, desc, baseName, err := buildDayData(ctx, dateStr)
 	if err != nil {
-		return fmt.Errorf("解析日期失败（格式应为 YYYY-MM-DD）: %w", err)
+		return err
 	}
-	data, err := generateAstroData(ctx.City, ctx.Lat, ctx.Lon, ctx.Loc, day, 1)
-	if err != nil {
-		return fmt.Errorf("生成指定日期天文数据失败: %w", err)
-	}
-	desc := fmt.Sprintf("指定日期：%s", day.Format("2006-01-02"))
-	baseName := fmt.Sprintf("%s-%s", sanitizeFileName(ctx.City), day.Format("2006-01-02"))
 	outFile, err := writeAstroFile(ctx.City, ctx.Now, data, desc, baseName)
 	if err != nil {
 		return fmt.Errorf("写入文件失败: %w", err)
@@ -595,24 +671,10 @@ func runDay(ctx *CityContext, dateStr string) error {
 }
 
 func runRange(ctx *CityContext, fromStr, toStr string) error {
-	start, err := parseDateInLocation(fromStr, ctx.Loc)
+	data, desc, baseName, err := buildRangeData(ctx, fromStr, toStr)
 	if err != nil {
-		return fmt.Errorf("解析起始日期失败（格式应为 YYYY-MM-DD）: %w", err)
+		return err
 	}
-	end, err := parseDateInLocation(toStr, ctx.Loc)
-	if err != nil {
-		return fmt.Errorf("解析结束日期失败（格式应为 YYYY-MM-DD）: %w", err)
-	}
-	if end.Before(start) {
-		return fmt.Errorf("结束日期不能早于起始日期")
-	}
-	days := int(end.Sub(start).Hours()/24) + 1
-	data, err := generateAstroData(ctx.City, ctx.Lat, ctx.Lon, ctx.Loc, start, days)
-	if err != nil {
-		return fmt.Errorf("生成区间天文数据失败: %w", err)
-	}
-	desc := fmt.Sprintf("日期区间：%s ~ %s，共 %d 天", start.Format("2006-01-02"), end.Format("2006-01-02"), days)
-	baseName := fmt.Sprintf("%s-%s_to_%s", sanitizeFileName(ctx.City), start.Format("2006-01-02"), end.Format("2006-01-02"))
 	outFile, err := writeAstroFile(ctx.City, ctx.Now, data, desc, baseName)
 	if err != nil {
 		return fmt.Errorf("写入文件失败: %w", err)
@@ -843,6 +905,141 @@ func (m tuiModel) View() string {
 	return b.String()
 }
 
+// -------------------- HTTP API --------------------
+
+type astroAPIResponse struct {
+	City       string       `json:"city"`
+	Display    string       `json:"display_name"`
+	Lat        float64      `json:"lat"`
+	Lon        float64      `json:"lon"`
+	Timezone   string       `json:"timezone"`
+	Mode       string       `json:"mode"`
+	Range      string       `json:"range,omitempty"`
+	Generated  string       `json:"generated_at"`
+	Data       []dailyAstro `json:"data"`
+	LocalTZTip string       `json:"local_time_tip"`
+}
+
+func astroAPIHandler(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	mode := strings.ToLower(q.Get("mode"))
+	if mode == "" {
+		mode = "year"
+	}
+
+	// 优先走 coords 模式：lat+lon+tz
+	latStr := q.Get("lat")
+	lonStr := q.Get("lon")
+	tzID := q.Get("tz")
+
+	var (
+		ctx *CityContext
+		err error
+	)
+
+	if latStr != "" && lonStr != "" && tzID != "" {
+		lat, err1 := strconv.ParseFloat(latStr, 64)
+		lon, err2 := strconv.ParseFloat(lonStr, 64)
+		if err1 != nil || err2 != nil {
+			http.Error(w, "lat/lon 解析失败", http.StatusBadRequest)
+			return
+		}
+		loc, err := time.LoadLocation(tzID)
+		if err != nil {
+			http.Error(w, "tz 加载失败: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		now := time.Now().In(loc)
+		cityName := q.Get("city")
+		if cityName == "" {
+			cityName = fmt.Sprintf("coords_%.4f_%.4f", lat, lon)
+		}
+		ctx = &CityContext{
+			City:        cityName,
+			DisplayName: cityName,
+			Lat:         lat,
+			Lon:         lon,
+			TZID:        tzID,
+			Loc:         loc,
+			Now:         now,
+		}
+	} else {
+		// 其次走城市名模式
+		city := q.Get("city")
+		if city == "" {
+			http.Error(w, "必须提供 city 或 lat+lon+tz 参数", http.StatusBadRequest)
+			return
+		}
+		ctx, err = prepareCity(city, offline)
+		if err != nil {
+			http.Error(w, "城市解析失败: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+	}
+
+	var (
+		data []dailyAstro
+		desc string
+	)
+
+	switch mode {
+	case "year":
+		var base string
+		data, desc, base, err = buildYearData(ctx)
+		_ = base
+	case "day":
+		dateStr := q.Get("date")
+		if dateStr == "" {
+			http.Error(w, "mode=day 时必须提供 date=YYYY-MM-DD", http.StatusBadRequest)
+			return
+		}
+		var base string
+		data, desc, base, err = buildDayData(ctx, dateStr)
+		_ = base
+	case "range":
+		fromStr := q.Get("from")
+		toStr := q.Get("to")
+		if fromStr == "" || toStr == "" {
+			http.Error(w, "mode=range 时必须提供 from/to=YYYY-MM-DD", http.StatusBadRequest)
+			return
+		}
+		var base string
+		data, desc, base, err = buildRangeData(ctx, fromStr, toStr)
+		_ = base
+	default:
+		http.Error(w, "mode 必须为 year/day/range", http.StatusBadRequest)
+		return
+	}
+
+	if err != nil {
+		http.Error(w, "生成天文数据失败: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	resp := astroAPIResponse{
+		City:       ctx.City,
+		Display:    ctx.DisplayName,
+		Lat:        ctx.Lat,
+		Lon:        ctx.Lon,
+		Timezone:   ctx.TZID,
+		Mode:       mode,
+		Range:      desc,
+		Generated:  ctx.Now.Format(time.RFC3339),
+		Data:       data,
+		LocalTZTip: "所有时间均为城市所在时区的当地时间",
+	}
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	_ = enc.Encode(resp)
+}
+
+func healthHandler(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("ok"))
+}
+
 // -------------------- Cobra 层 --------------------
 
 var (
@@ -851,6 +1048,19 @@ var (
 	rangeToS   string
 	offline    bool
 	cacheForce bool
+
+	// coords 子命令 flags
+	coordsLat   float64
+	coordsLon   float64
+	coordsTZ    string
+	coordsMode  string
+	coordsDate  string
+	coordsFrom  string
+	coordsTo    string
+	coordsCity  string
+
+	// serve 子命令 flag
+	serveAddr string
 )
 
 func getCityFromArgsOrPrompt(args []string) string {
@@ -868,7 +1078,7 @@ var rootCmd = &cobra.Command{
 	Short: "eSunMoon - 城市天文数据生成器",
 	Long: `eSunMoon - 城市天文数据生成器
 
-根据城市名称自动获取经纬度和时区，生成天文数据（全部为当地时间），
+根据城市名称或经纬度自动获取时区，生成天文数据（全部为当地时间），
 并在控制台输出当前时间太阳与月亮的位置（方位角、高度角、距离）。
 
 默认行为：等同于 "esunmoon year <城市名>"，即从今天起一年。
@@ -945,6 +1155,67 @@ var rangeCmd = &cobra.Command{
 	},
 }
 
+// coords 子命令：直接用经纬度 + 时区
+var coordsCmd = &cobra.Command{
+	Use:   "coords",
+	Short: "通过经纬度 + 时区直接生成天文数据（绕过城市地理编码）",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if coordsTZ == "" {
+			return fmt.Errorf("--tz 必须指定，例如 Asia/Shanghai")
+		}
+		loc, err := time.LoadLocation(coordsTZ)
+		if err != nil {
+			return fmt.Errorf("加载时区失败 (%s): %w", coordsTZ, err)
+		}
+		now := time.Now().In(loc)
+		cityName := coordsCity
+		if cityName == "" {
+			cityName = fmt.Sprintf("coords_%.4f_%.4f", coordsLat, coordsLon)
+		}
+		ctx := &CityContext{
+			City:        cityName,
+			DisplayName: cityName,
+			Lat:         coordsLat,
+			Lon:         coordsLon,
+			TZID:        coordsTZ,
+			Loc:         loc,
+			Now:         now,
+		}
+
+		fmt.Println("-------------------------------------------------")
+		fmt.Printf("[eSunMoon] Coords 模式\n")
+		fmt.Printf("城市名: %s\n", cityName)
+		fmt.Printf("经纬度: %.4f, %.4f\n", coordsLat, coordsLon)
+		fmt.Printf("时区:   %s\n", coordsTZ)
+		fmt.Printf("当前当地时间: %s\n", now.Format("2006-01-02 15:04:05"))
+		fmt.Println("-------------------------------------------------")
+		printSunMoonPosition(ctx)
+
+		mode := strings.ToLower(coordsMode)
+		if mode == "" {
+			mode = "year"
+		}
+
+		switch mode {
+		case "year":
+			return runYear(ctx)
+		case "day":
+			if coordsDate == "" {
+				return fmt.Errorf("coords mode=day 时必须使用 --date 指定日期（YYYY-MM-DD）")
+			}
+			return runDay(ctx, coordsDate)
+		case "range":
+			if coordsFrom == "" || coordsTo == "" {
+				return fmt.Errorf("coords mode=range 时必须同时指定 --from 和 --to（YYYY-MM-DD）")
+			}
+			return runRange(ctx, coordsFrom, coordsTo)
+		default:
+			return fmt.Errorf("coords --mode 必须为 year/day/range")
+		}
+	},
+}
+
+// TUI 子命令
 var tuiCmd = &cobra.Command{
 	Use:   "tui",
 	Short: "以终端 TUI 界面选择城市、模式和输出格式并生成天文数据",
@@ -1040,6 +1311,27 @@ var cacheClearCmd = &cobra.Command{
 	},
 }
 
+// serve 子命令：HTTP 服务模式
+var serveCmd = &cobra.Command{
+	Use:   "serve",
+	Short: "启动 HTTP 服务，提供 /api/astro REST 接口（默认端口 :8080）",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if serveAddr == "" {
+			serveAddr = ":8080"
+		}
+		mux := http.NewServeMux()
+		mux.HandleFunc("/api/astro", astroAPIHandler)
+		mux.HandleFunc("/healthz", healthHandler)
+
+		fmt.Printf("eSunMoon HTTP 服务启动：%s\n", serveAddr)
+		fmt.Println("  GET /healthz")
+		fmt.Println("  GET /api/astro?city=Beijing&mode=day&date=2025-01-01")
+		fmt.Println("  或：/api/astro?lat=39.9&lon=116.4&tz=Asia/Shanghai&mode=year")
+
+		return http.ListenAndServe(serveAddr, mux)
+	},
+}
+
 func init() {
 	rootCmd.PersistentFlags().BoolVar(&offline, "offline", false, "离线模式：仅使用本地缓存，不进行任何网络请求")
 	rootCmd.PersistentFlags().StringVar(&outFormat, "format", "txt", "输出格式：txt/csv/json/excel")
@@ -1050,10 +1342,29 @@ func init() {
 
 	cacheClearCmd.Flags().BoolVarP(&cacheForce, "yes", "y", false, "不询问直接清空缓存")
 
+	// coords flags
+	coordsCmd.Flags().Float64Var(&coordsLat, "lat", 0, "纬度（必填）")
+	coordsCmd.Flags().Float64Var(&coordsLon, "lon", 0, "经度（必填）")
+	coordsCmd.Flags().StringVar(&coordsTZ, "tz", "", "时区 ID（如 Asia/Shanghai，必填）")
+	coordsCmd.Flags().StringVar(&coordsMode, "mode", "year", "模式：year/day/range")
+	coordsCmd.Flags().StringVar(&coordsDate, "date", "", "mode=day 时的日期 (YYYY-MM-DD)")
+	coordsCmd.Flags().StringVar(&coordsFrom, "from", "", "mode=range 起始日期 (YYYY-MM-DD)")
+	coordsCmd.Flags().StringVar(&coordsTo, "to", "", "mode=range 结束日期 (YYYY-MM-DD)")
+	coordsCmd.Flags().StringVar(&coordsCity, "city", "", "自定义城市名（用于文件名和返回信息）")
+
+	_ = coordsCmd.MarkFlagRequired("lat")
+	_ = coordsCmd.MarkFlagRequired("lon")
+	_ = coordsCmd.MarkFlagRequired("tz")
+
+	// serve flags
+	serveCmd.Flags().StringVar(&serveAddr, "addr", ":8080", "HTTP 监听地址，例如 :8080 或 127.0.0.1:9000")
+
 	rootCmd.AddCommand(yearCmd)
 	rootCmd.AddCommand(dayCmd)
 	rootCmd.AddCommand(rangeCmd)
+	rootCmd.AddCommand(coordsCmd)
 	rootCmd.AddCommand(tuiCmd)
+	rootCmd.AddCommand(serveCmd)
 
 	cacheCmd.AddCommand(cacheListCmd)
 	cacheCmd.AddCommand(cacheClearCmd)
