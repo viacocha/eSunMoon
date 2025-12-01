@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -2385,6 +2386,42 @@ func TestGeocodeCityHTTPError(t *testing.T) {
 	}
 	if _, _, _, err := geocodeCity(context.Background(), client, "Beijing"); err == nil {
 		t.Error("expected geocodeCity to fail on HTTP error")
+	}
+}
+
+func TestPrepareCityGeocodeError(t *testing.T) {
+	origClient := app.client
+	defer func() { app.client = origClient }()
+
+	app.client = &httpClientMock{
+		doFunc: func(req *http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: 500, Body: io.NopCloser(strings.NewReader("err"))}, nil
+		},
+	}
+	if _, err := prepareCity("AnyCity", false); err == nil {
+		t.Error("expected prepareCity to fail when geocode returns non-200")
+	}
+}
+
+func TestServeWithGracefulShutdown(t *testing.T) {
+	stop := make(chan os.Signal, 1)
+	handler := http.NewServeMux()
+	handler.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		stop <- syscall.SIGINT
+	}()
+
+	err := serveWithGracefulShutdown(":0", handler, stop)
+	if err != nil && err != http.ErrServerClosed {
+		// 沙箱环境可能禁止监听端口，检测后跳过
+		if strings.Contains(err.Error(), "operation not permitted") {
+			t.Skipf("skip due to sandbox restrictions: %v", err)
+		}
+		t.Fatalf("serveWithGracefulShutdown returned error: %v", err)
 	}
 }
 

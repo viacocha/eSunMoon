@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/csv"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -12,10 +13,12 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -1220,6 +1223,37 @@ type astroAPIResponse struct {
 	Notes      []string     `json:"notes,omitempty"`
 }
 
+// serveWithGracefulShutdown 启动 HTTP 服务并在接收到停止信号时优雅关闭。
+func serveWithGracefulShutdown(addr string, handler http.Handler, stop <-chan os.Signal) error {
+	srv := &http.Server{Addr: addr, Handler: handler}
+	errCh := make(chan error, 1)
+
+	go func() {
+		if err := srv.ListenAndServe(); err != nil {
+			errCh <- err
+		} else {
+			errCh <- nil
+		}
+	}()
+
+	for {
+		select {
+		case sig := <-stop:
+			logInfof("收到信号 %v，开始优雅关闭 HTTP 服务...", sig)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := srv.Shutdown(ctx); err != nil {
+				return fmt.Errorf("优雅关闭失败: %w", err)
+			}
+		case err := <-errCh:
+			if err != nil && !errors.Is(err, http.ErrServerClosed) {
+				return err
+			}
+			return nil
+		}
+	}
+}
+
 // astroAPIHandler 处理 /api/astro 请求，支持城市或坐标查询。
 func astroAPIHandler(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
@@ -1482,7 +1516,7 @@ var coordsCmd = &cobra.Command{
 		if coordsTZ == "" {
 			return fmt.Errorf("--tz 必须指定，例如 Asia/Shanghai")
 		}
-		loc, err := time.LoadLocation(coordsTZ)
+		loc, err := loadLocationFunc(coordsTZ)
 		if err != nil {
 			return fmt.Errorf("加载时区失败 (%s): %w", coordsTZ, err)
 		}
@@ -1648,7 +1682,9 @@ var serveCmd = &cobra.Command{
 		logInfof("GET /api/astro?city=Beijing&mode=day&date=2025-01-01")
 		logInfof("GET /api/astro?lat=39.9&lon=116.4&tz=Asia/Shanghai&mode=year")
 
-		return http.ListenAndServe(serveAddr, mux)
+		stop := make(chan os.Signal, 1)
+		signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+		return serveWithGracefulShutdown(serveAddr, mux, stop)
 	},
 }
 
