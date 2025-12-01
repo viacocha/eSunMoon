@@ -260,6 +260,8 @@ type AstroApp struct {
 	cacheTTL time.Duration
 	now      func() time.Time
 	logger   *Logger
+	tzLookup func(float64, float64) (string, error)
+	loadTZ   func(string) (*time.Location, error)
 }
 
 // newAstroApp 创建默认的应用单例。
@@ -269,19 +271,17 @@ func newAstroApp() *AstroApp {
 		cacheTTL: 100 * 24 * time.Hour,
 		now:      time.Now,
 		logger:   NewLogger(os.Stdout, LevelInfo, false, false, time.Now),
+		tzLookup: lookupTimeZone,
+		loadTZ:   time.LoadLocation,
 	}
 }
 
 var app = newAstroApp()
 
-var (
-	lookupTimeZoneFunc = lookupTimeZone
-	loadLocationFunc   = time.LoadLocation
-)
-
 type AppConfig struct {
 	Format         string
 	AllowOverwrite bool
+	OutDir         string
 	Offline        bool
 	LogLevel       string
 	LogJSON        bool
@@ -291,6 +291,7 @@ type AppConfig struct {
 var config = &AppConfig{
 	Format:         "txt",
 	AllowOverwrite: false,
+	OutDir:         "",
 	Offline:        false,
 	LogLevel:       "info",
 	LogJSON:        false,
@@ -525,12 +526,16 @@ func generateAstroData(cityName string, lat, lon float64, loc *time.Location, st
 type OutputOptions struct {
 	Format         string
 	AllowOverwrite bool
+	OutDir         string
 }
 
 // writeAstroFile 根据输出格式写文件，返回文件路径。
-func writeAstroFile(format string, allowOverwrite bool, cityName string, now time.Time, data []dailyAstro, desc, baseName string) (string, error) {
+func writeAstroFile(format string, allowOverwrite bool, outDir string, cityName string, now time.Time, data []dailyAstro, desc, baseName string) (string, error) {
 	if baseName == "" {
 		baseName = fmt.Sprintf("%s-%s", sanitizeFileName(cityName), now.Format("2006-01-02"))
+	}
+	if outDir != "" {
+		baseName = filepath.Join(outDir, filepath.Base(baseName))
 	}
 	switch strings.ToLower(format) {
 	case "txt":
@@ -808,11 +813,11 @@ func prepareCity(city string, offline bool) (*CityContext, error) {
 	if err != nil {
 		return nil, fmt.Errorf("获取城市坐标失败: %w", err)
 	}
-	tzID, err := lookupTimeZoneFunc(lat, lon)
+	tzID, err := app.tzLookup(lat, lon)
 	if err != nil {
 		return nil, fmt.Errorf("自动检测时区失败: %w", err)
 	}
-	loc, err := loadLocationFunc(tzID)
+	loc, err := app.loadTZ(tzID)
 	if err != nil {
 		return nil, fmt.Errorf("加载时区失败 (%s): %w", tzID, err)
 	}
@@ -944,7 +949,7 @@ func runYear(ctx *CityContext, opts OutputOptions) error {
 	if err != nil {
 		return err
 	}
-	outFile, err := writeAstroFile(opts.Format, opts.AllowOverwrite, ctx.City, ctx.Now, data, desc, baseName)
+	outFile, err := writeAstroFile(opts.Format, opts.AllowOverwrite, opts.OutDir, ctx.City, ctx.Now, data, desc, baseName)
 	if err != nil {
 		return fmt.Errorf("写入文件失败: %w", err)
 	}
@@ -958,7 +963,7 @@ func runDay(ctx *CityContext, dateStr string, opts OutputOptions) error {
 	if err != nil {
 		return err
 	}
-	outFile, err := writeAstroFile(opts.Format, opts.AllowOverwrite, ctx.City, ctx.Now, data, desc, baseName)
+	outFile, err := writeAstroFile(opts.Format, opts.AllowOverwrite, opts.OutDir, ctx.City, ctx.Now, data, desc, baseName)
 	if err != nil {
 		return fmt.Errorf("写入文件失败: %w", err)
 	}
@@ -972,7 +977,7 @@ func runRange(ctx *CityContext, fromStr, toStr string, opts OutputOptions) error
 	if err != nil {
 		return err
 	}
-	outFile, err := writeAstroFile(opts.Format, opts.AllowOverwrite, ctx.City, ctx.Now, data, desc, baseName)
+	outFile, err := writeAstroFile(opts.Format, opts.AllowOverwrite, opts.OutDir, ctx.City, ctx.Now, data, desc, baseName)
 	if err != nil {
 		return fmt.Errorf("写入文件失败: %w", err)
 	}
@@ -1223,6 +1228,17 @@ type astroAPIResponse struct {
 	Notes      []string     `json:"notes,omitempty"`
 }
 
+// readyHandler 检查基本就绪状态（缓存目录可写）。
+func readyHandler(w http.ResponseWriter, r *http.Request) {
+	dir := filepath.Dir(cacheFilePath())
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		http.Error(w, "cache dir not writable", http.StatusServiceUnavailable)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("ready"))
+}
+
 // serveWithGracefulShutdown 启动 HTTP 服务并在接收到停止信号时优雅关闭。
 func serveWithGracefulShutdown(addr string, handler http.Handler, stop <-chan os.Signal) error {
 	srv := &http.Server{Addr: addr, Handler: handler}
@@ -1240,7 +1256,7 @@ func serveWithGracefulShutdown(addr string, handler http.Handler, stop <-chan os
 		select {
 		case sig := <-stop:
 			logInfof("收到信号 %v，开始优雅关闭 HTTP 服务...", sig)
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), serveShutdown)
 			defer cancel()
 			if err := srv.Shutdown(ctx); err != nil {
 				return fmt.Errorf("优雅关闭失败: %w", err)
@@ -1400,7 +1416,8 @@ var (
 	coordsCity string
 
 	// serve 子命令 flag
-	serveAddr string
+	serveAddr     string
+	serveShutdown time.Duration
 
 	// logger flags
 	logLevelFlag string
@@ -1447,7 +1464,7 @@ var rootCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
-		return runYear(ctx, OutputOptions{Format: config.Format, AllowOverwrite: config.AllowOverwrite})
+		return runYear(ctx, OutputOptions{Format: config.Format, AllowOverwrite: config.AllowOverwrite, OutDir: config.OutDir})
 	},
 }
 
@@ -1464,7 +1481,7 @@ var yearCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
-		return runYear(ctx, OutputOptions{Format: config.Format, AllowOverwrite: config.AllowOverwrite})
+		return runYear(ctx, OutputOptions{Format: config.Format, AllowOverwrite: config.AllowOverwrite, OutDir: config.OutDir})
 	},
 }
 
@@ -1484,7 +1501,7 @@ var dayCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
-		return runDay(ctx, dayDate, OutputOptions{Format: config.Format, AllowOverwrite: config.AllowOverwrite})
+		return runDay(ctx, dayDate, OutputOptions{Format: config.Format, AllowOverwrite: config.AllowOverwrite, OutDir: config.OutDir})
 	},
 }
 
@@ -1504,7 +1521,7 @@ var rangeCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
-		return runRange(ctx, rangeFromS, rangeToS, OutputOptions{Format: config.Format, AllowOverwrite: config.AllowOverwrite})
+		return runRange(ctx, rangeFromS, rangeToS, OutputOptions{Format: config.Format, AllowOverwrite: config.AllowOverwrite, OutDir: config.OutDir})
 	},
 }
 
@@ -1516,7 +1533,7 @@ var coordsCmd = &cobra.Command{
 		if coordsTZ == "" {
 			return fmt.Errorf("--tz 必须指定，例如 Asia/Shanghai")
 		}
-		loc, err := loadLocationFunc(coordsTZ)
+		loc, err := app.loadTZ(coordsTZ)
 		if err != nil {
 			return fmt.Errorf("加载时区失败 (%s): %w", coordsTZ, err)
 		}
@@ -1551,17 +1568,17 @@ var coordsCmd = &cobra.Command{
 
 		switch mode {
 		case "year":
-			return runYear(ctx, OutputOptions{Format: config.Format, AllowOverwrite: config.AllowOverwrite})
+			return runYear(ctx, OutputOptions{Format: config.Format, AllowOverwrite: config.AllowOverwrite, OutDir: config.OutDir})
 		case "day":
 			if coordsDate == "" {
 				return fmt.Errorf("coords mode=day 时必须使用 --date 指定日期（YYYY-MM-DD）")
 			}
-			return runDay(ctx, coordsDate, OutputOptions{Format: config.Format, AllowOverwrite: config.AllowOverwrite})
+			return runDay(ctx, coordsDate, OutputOptions{Format: config.Format, AllowOverwrite: config.AllowOverwrite, OutDir: config.OutDir})
 		case "range":
 			if coordsFrom == "" || coordsTo == "" {
 				return fmt.Errorf("coords mode=range 时必须同时指定 --from 和 --to（YYYY-MM-DD）")
 			}
-			return runRange(ctx, coordsFrom, coordsTo, OutputOptions{Format: config.Format, AllowOverwrite: config.AllowOverwrite})
+			return runRange(ctx, coordsFrom, coordsTo, OutputOptions{Format: config.Format, AllowOverwrite: config.AllowOverwrite, OutDir: config.OutDir})
 		default:
 			return fmt.Errorf("coords --mode 必须为 year/day/range")
 		}
@@ -1591,7 +1608,7 @@ var tuiCmd = &cobra.Command{
 			return err
 		}
 		config.Format = tm.formats[tm.formatIndex]
-		opts := OutputOptions{Format: config.Format, AllowOverwrite: config.AllowOverwrite}
+		opts := OutputOptions{Format: config.Format, AllowOverwrite: config.AllowOverwrite, OutDir: config.OutDir}
 		switch tm.modes[tm.modeIndex] {
 		case "Year":
 			return runYear(ctx, opts)
@@ -1676,9 +1693,11 @@ var serveCmd = &cobra.Command{
 		mux := http.NewServeMux()
 		mux.HandleFunc("/api/astro", astroAPIHandler)
 		mux.HandleFunc("/healthz", healthHandler)
+		mux.HandleFunc("/readyz", readyHandler)
 
 		logInfof("eSunMoon HTTP 服务启动：%s", serveAddr)
 		logInfof("GET /healthz")
+		logInfof("GET /readyz")
 		logInfof("GET /api/astro?city=Beijing&mode=day&date=2025-01-01")
 		logInfof("GET /api/astro?lat=39.9&lon=116.4&tz=Asia/Shanghai&mode=year")
 
@@ -1692,6 +1711,7 @@ func init() {
 	rootCmd.PersistentFlags().BoolVar(&config.Offline, "offline", false, "离线模式：仅使用本地缓存，不进行任何网络请求")
 	rootCmd.PersistentFlags().StringVar(&config.Format, "format", "txt", "输出格式：txt/csv/json/excel")
 	rootCmd.PersistentFlags().BoolVar(&config.AllowOverwrite, "overwrite", false, "允许覆盖已存在的输出文件")
+	rootCmd.PersistentFlags().StringVar(&config.OutDir, "outdir", "", "输出文件目录（默认当前目录）")
 	rootCmd.PersistentFlags().StringVar(&logLevelFlag, "log-level", config.LogLevel, "日志级别：debug/info/warn/error")
 	rootCmd.PersistentFlags().BoolVar(&logJSONFlag, "log-json", config.LogJSON, "日志使用 JSON 格式输出")
 	rootCmd.PersistentFlags().BoolVar(&logQuietFlag, "log-quiet", config.LogQuiet, "禁用日志输出")
@@ -1718,6 +1738,7 @@ func init() {
 
 	// serve flags
 	serveCmd.Flags().StringVar(&serveAddr, "addr", ":8080", "HTTP 监听地址，例如 :8080 或 127.0.0.1:9000")
+	serveCmd.Flags().DurationVar(&serveShutdown, "shutdown-timeout", 5*time.Second, "优雅退出超时时间")
 
 	rootCmd.AddCommand(yearCmd)
 	rootCmd.AddCommand(dayCmd)

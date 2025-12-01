@@ -437,7 +437,7 @@ func TestWriteAstroFile(t *testing.T) {
 		tmpDir := t.TempDir()
 		filePath := filepath.Join(tmpDir, "astro."+format)
 
-		out, err := writeAstroFile(format, true, "TestCity", now, data, "test range", filePath[:len(filePath)-len(format)-1])
+		out, err := writeAstroFile(format, true, "", "TestCity", now, data, "test range", filePath[:len(filePath)-len(format)-1])
 
 		if err != nil {
 			t.Errorf("writeAstroFile with format %s error: %v", format, err)
@@ -738,6 +738,19 @@ func TestHealthHandler(t *testing.T) {
 	}
 }
 
+func TestReadyHandler(t *testing.T) {
+	req := httptest.NewRequest("GET", "/readyz", nil)
+	w := httptest.NewRecorder()
+
+	readyHandler(w, req)
+	resp := w.Result()
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+}
+
 // 添加更多HTTP API测试用例
 func TestAstroAPIHandlerRangeCoords(t *testing.T) {
 	req := httptest.NewRequest("GET", "/api/astro?lat=0&lon=0&tz=UTC&mode=range&from=2025-01-01&to=2025-01-05", nil)
@@ -1030,7 +1043,7 @@ func TestWriteAstroFileFormats(t *testing.T) {
 
 	for _, format := range formats {
 		baseName := filepath.Join(tmpDir, "test")
-		out, err := writeAstroFile(format, true, "TestCity", now, data, "test range", baseName)
+		out, err := writeAstroFile(format, true, "", "TestCity", now, data, "test range", baseName)
 
 		// 检查结果
 		if err != nil {
@@ -1146,7 +1159,7 @@ func TestRunFunctions(t *testing.T) {
 	_ = os.Chdir(tmpDir)
 	defer os.Chdir(origDir)
 
-	opts := OutputOptions{Format: "json", AllowOverwrite: true}
+	opts := OutputOptions{Format: "json", AllowOverwrite: true, OutDir: ""}
 	err := runYear(ctx, opts)
 
 	// runYear可能会因为网络或文件系统问题而失败，但我们至少测试它不会崩溃
@@ -1176,7 +1189,7 @@ func TestRunDay(t *testing.T) {
 	_ = os.Chdir(tmpDir)
 	defer os.Chdir(origDir)
 
-	opts := OutputOptions{Format: "json", AllowOverwrite: true}
+	opts := OutputOptions{Format: "json", AllowOverwrite: true, OutDir: ""}
 	err := runDay(ctx, "2025-01-01", opts)
 
 	// runDay可能会因为网络或文件系统问题而失败，但我们至少测试它不会崩溃
@@ -1206,7 +1219,7 @@ func TestRunRange(t *testing.T) {
 	_ = os.Chdir(tmpDir)
 	defer os.Chdir(origDir)
 
-	opts := OutputOptions{Format: "json", AllowOverwrite: true}
+	opts := OutputOptions{Format: "json", AllowOverwrite: true, OutDir: ""}
 	err := runRange(ctx, "2025-01-01", "2025-01-05", opts)
 
 	// runRange可能会因为网络或文件系统问题而失败，但我们至少测试它不会崩溃
@@ -1243,9 +1256,9 @@ func TestRunYearNoOverwrite(t *testing.T) {
 	_ = os.Chdir(tmpDir)
 	defer os.Chdir(origDir)
 
-	opts := OutputOptions{Format: "json", AllowOverwrite: false}
+	opts := OutputOptions{Format: "json", AllowOverwrite: false, OutDir: ""}
 	// 先生成文件
-	_ = runYear(ctx, OutputOptions{Format: "json", AllowOverwrite: true})
+	_ = runYear(ctx, OutputOptions{Format: "json", AllowOverwrite: true, OutDir: ""})
 	err := runYear(ctx, opts)
 	if err == nil {
 		t.Error("expected error when overwrite disabled for runYear")
@@ -1269,9 +1282,9 @@ func TestRunDayNoOverwrite(t *testing.T) {
 	_ = os.Chdir(tmpDir)
 	defer os.Chdir(origDir)
 
-	opts := OutputOptions{Format: "json", AllowOverwrite: false}
+	opts := OutputOptions{Format: "json", AllowOverwrite: false, OutDir: ""}
 	// 先生成文件
-	_ = runDay(ctx, "2025-01-01", OutputOptions{Format: "json", AllowOverwrite: true})
+	_ = runDay(ctx, "2025-01-01", OutputOptions{Format: "json", AllowOverwrite: true, OutDir: ""})
 	err := runDay(ctx, "2025-01-01", opts)
 	if err == nil {
 		t.Error("expected error when overwrite disabled for runDay")
@@ -2330,14 +2343,14 @@ func TestPrepareCityInvalidTimezoneInCache(t *testing.T) {
 }
 
 func TestPrepareCityLookupTimeZoneError(t *testing.T) {
-	origLookup := lookupTimeZoneFunc
+	origLookup := app.tzLookup
 	origClient := app.client
 	defer func() {
-		lookupTimeZoneFunc = origLookup
+		app.tzLookup = origLookup
 		app.client = origClient
 	}()
 
-	lookupTimeZoneFunc = func(lat, lon float64) (string, error) {
+	app.tzLookup = func(lat, lon float64) (string, error) {
 		return "", fmt.Errorf("tz lookup fail")
 	}
 	app.client = &httpClientMock{
@@ -2352,19 +2365,19 @@ func TestPrepareCityLookupTimeZoneError(t *testing.T) {
 }
 
 func TestPrepareCityLoadLocationError(t *testing.T) {
-	origLookup := lookupTimeZoneFunc
-	origLoad := loadLocationFunc
+	origLookup := app.tzLookup
+	origLoad := app.loadTZ
 	origClient := app.client
 	defer func() {
-		lookupTimeZoneFunc = origLookup
-		loadLocationFunc = origLoad
+		app.tzLookup = origLookup
+		app.loadTZ = origLoad
 		app.client = origClient
 	}()
 
-	lookupTimeZoneFunc = func(lat, lon float64) (string, error) {
+	app.tzLookup = func(lat, lon float64) (string, error) {
 		return "Invalid/Zone", nil
 	}
-	loadLocationFunc = func(name string) (*time.Location, error) {
+	app.loadTZ = func(name string) (*time.Location, error) {
 		return nil, fmt.Errorf("load location fail")
 	}
 	app.client = &httpClientMock{
