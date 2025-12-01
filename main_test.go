@@ -448,6 +448,41 @@ func TestWriteAstroFile(t *testing.T) {
 	}
 }
 
+func TestWriteAstroFileWithOutDir(t *testing.T) {
+	loc, _ := time.LoadLocation("UTC")
+	now := time.Date(2025, 1, 2, 15, 4, 5, 0, loc)
+	data := []dailyAstro{
+		{
+			Date:                "2025-01-01",
+			Sunrise:             "06:00",
+			Sunset:              "18:00",
+			SolarNoon:           "12:00",
+			MaxAltitude:         "60.00",
+			DayLength:           "12:00",
+			Moonrise:            "20:00",
+			Moonset:             "06:00",
+			MoonIllumFrac:       "50.0%",
+			MaxAltitudeNum:      60.0,
+			DayLengthMinutes:    720,
+			MoonIlluminationNum: 0.5,
+			HasSunrise:          true,
+			HasSunset:           true,
+			HasDayLength:        true,
+		},
+	}
+	outDir := t.TempDir()
+	out, err := writeAstroFile("json", true, outDir, "TestCity", now, data, "test range", "TestCity-2025-01-01")
+	if err != nil {
+		t.Fatalf("writeAstroFile with outdir error: %v", err)
+	}
+	if !strings.HasPrefix(out, outDir) {
+		t.Errorf("output path should be under outDir, got %s", out)
+	}
+	if _, err := os.Stat(out); err != nil {
+		t.Fatalf("output file not found: %v", err)
+	}
+}
+
 //
 // ----------- 工具函数测试 -----------
 //
@@ -1288,6 +1323,33 @@ func TestRunDayNoOverwrite(t *testing.T) {
 	err := runDay(ctx, "2025-01-01", opts)
 	if err == nil {
 		t.Error("expected error when overwrite disabled for runDay")
+	}
+}
+
+func TestRunDayWithOutDir(t *testing.T) {
+	loc, _ := time.LoadLocation("UTC")
+	ctx := &CityContext{
+		City:        "TestCity",
+		DisplayName: "Test City",
+		Lat:         0,
+		Lon:         0,
+		TZID:        "UTC",
+		Loc:         loc,
+		Now:         time.Date(2025, 1, 2, 15, 4, 5, 0, loc),
+	}
+	tmpDir := t.TempDir()
+	t.Setenv("HOME", tmpDir)
+	outDir := filepath.Join(tmpDir, "out")
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		t.Fatalf("failed to create outdir: %v", err)
+	}
+	opts := OutputOptions{Format: "json", AllowOverwrite: true, OutDir: outDir}
+	if err := runDay(ctx, "2025-01-01", opts); err != nil {
+		t.Fatalf("runDay with outdir error: %v", err)
+	}
+	expected := filepath.Join(outDir, "TestCity-2025-01-01.json")
+	if _, err := os.Stat(expected); err != nil {
+		t.Errorf("expected output in outdir, file missing: %v", err)
 	}
 }
 
