@@ -2547,6 +2547,29 @@ func TestServeWithGracefulShutdownBadAddr(t *testing.T) {
 	}
 }
 
+func TestServeWithGracefulShutdownSuccess(t *testing.T) {
+	stop := make(chan os.Signal, 1)
+	handler := http.NewServeMux()
+	handler.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	done := make(chan error, 1)
+	go func() {
+		done <- serveWithGracefulShutdown("127.0.0.1:0", handler, stop)
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	stop <- syscall.SIGTERM
+
+	if err := <-done; err != nil && err != http.ErrServerClosed {
+		if strings.Contains(err.Error(), "operation not permitted") {
+			t.Skipf("skip due to sandbox restrictions: %v", err)
+		}
+		t.Fatalf("serveWithGracefulShutdown should exit gracefully, got %v", err)
+	}
+}
+
 // 测试prepareCity的在线模式（mock网络请求）
 func TestPrepareCityOnlineMode(t *testing.T) {
 	// 由于prepareCity的在线模式需要网络请求，我们跳过这个测试
