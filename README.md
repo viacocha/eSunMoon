@@ -337,6 +337,7 @@ esunmoon serve --addr :8080 --shutdown-timeout 10s
 HTTP 速览：
 	•	GET /api/astro?city=Beijing&mode=day&date=2025-01-01
 	•	GET /api/astro?lat=39.9&lon=116.4&tz=Asia/Shanghai&mode=year
+	•	GET /readyz  # 就绪检查（缓存目录可写）
 
 ⸻
 
