@@ -40,6 +40,31 @@ func TestNormalizeCityKey(t *testing.T) {
 	}
 }
 
+func TestRunYearWithOutDir(t *testing.T) {
+	loc, _ := time.LoadLocation("UTC")
+	ctx := &CityContext{
+		City:        "TestCity",
+		DisplayName: "Test City",
+		Lat:         0,
+		Lon:         0,
+		TZID:        "UTC",
+		Loc:         loc,
+		Now:         time.Date(2025, 1, 2, 15, 4, 5, 0, loc),
+	}
+	tmpDir := t.TempDir()
+	t.Setenv("HOME", tmpDir)
+	outDir := filepath.Join(tmpDir, "out")
+	_ = os.MkdirAll(outDir, 0o755)
+	opts := OutputOptions{Format: "json", AllowOverwrite: true, OutDir: outDir}
+	if err := runYear(ctx, opts); err != nil {
+		t.Fatalf("runYear with outdir error: %v", err)
+	}
+	expected := filepath.Join(outDir, "TestCity-2025-01-02-year.json")
+	if _, err := os.Stat(expected); err != nil {
+		t.Errorf("expected output under outdir, got err: %v", err)
+	}
+}
+
 func TestFormatDuration(t *testing.T) {
 	if got := formatDuration(0); got != "--" {
 		t.Errorf("formatDuration(0) = %q, want %q", got, "--")
@@ -783,6 +808,20 @@ func TestReadyHandler(t *testing.T) {
 
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+}
+
+func TestReadyHandlerFailure(t *testing.T) {
+	t.Setenv("HOME", "/dev/null") // 触发目录创建失败
+	req := httptest.NewRequest("GET", "/readyz", nil)
+	w := httptest.NewRecorder()
+
+	readyHandler(w, req)
+	resp := w.Result()
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusServiceUnavailable)
 	}
 }
 
@@ -2497,6 +2536,14 @@ func TestServeWithGracefulShutdown(t *testing.T) {
 			t.Skipf("skip due to sandbox restrictions: %v", err)
 		}
 		t.Fatalf("serveWithGracefulShutdown returned error: %v", err)
+	}
+}
+
+func TestServeWithGracefulShutdownBadAddr(t *testing.T) {
+	stop := make(chan os.Signal, 1)
+	err := serveWithGracefulShutdown("bad:addr", http.NewServeMux(), stop)
+	if err == nil {
+		t.Fatal("expected error for bad addr")
 	}
 }
 
