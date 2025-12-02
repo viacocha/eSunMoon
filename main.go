@@ -100,6 +100,62 @@ func radToDeg(r float64) float64 {
 	return r * 180 / math.Pi
 }
 
+// describeAzimuth 将方位角（库定义：0 为正南，向西为正）转为直观方位文字。
+func describeAzimuth(azDeg float64) string {
+	heading := math.Mod(azDeg+180, 360) // 转换为以正北为 0、顺时针的角度
+
+	var base string
+	var offset float64
+	var toward string
+
+	switch {
+	case heading >= 315 || heading < 45:
+		base = "正北"
+		if heading >= 315 {
+			offset = 360 - heading
+			toward = "西"
+		} else {
+			offset = heading
+			toward = "东"
+		}
+	case heading >= 45 && heading < 135:
+		base = "正东"
+		offset = math.Abs(heading - 90)
+		if heading < 90 {
+			toward = "北"
+		} else {
+			toward = "南"
+		}
+	case heading >= 135 && heading < 225:
+		base = "正南"
+		offset = math.Abs(heading - 180)
+		if heading < 180 {
+			toward = "东"
+		} else {
+			toward = "西"
+		}
+	default: // heading in [225, 315)
+		base = "正西"
+		offset = math.Abs(heading - 270)
+		if heading < 270 {
+			toward = "南"
+		} else {
+			toward = "北"
+		}
+	}
+
+	if offset < 1 {
+		return base
+	}
+
+	modifier := "偏"
+	if offset < 10 {
+		modifier = "略微偏"
+	}
+
+	return fmt.Sprintf("%s%s%s", base, modifier, toward)
+}
+
 // 太阳距离（km），近似
 // earthSunDistanceKm 计算给定时间地球到太阳的近似距离（千米）。
 func earthSunDistanceKm(t time.Time) float64 {
@@ -286,6 +342,8 @@ type AppConfig struct {
 	LogLevel       string
 	LogJSON        bool
 	LogQuiet       bool
+	LiveOnly       bool
+	LiveInterval   time.Duration
 }
 
 var config = &AppConfig{
@@ -296,6 +354,8 @@ var config = &AppConfig{
 	LogLevel:       "info",
 	LogJSON:        false,
 	LogQuiet:       false,
+	LiveOnly:       false,
+	LiveInterval:   5 * time.Second,
 }
 
 // -------------------- Logger --------------------
@@ -878,9 +938,37 @@ func printSunMoonPosition(ctx *CityContext) {
 	moonDistKm := moonPos.Distance
 
 	fmt.Println("实时天体位置（当地时间）")
-	logInfof("太阳：方位角 %.2f°，高度角 %.2f°，距离约 %.0f km", sunAzDeg, sunAltDeg, sunDistKm)
-	logInfof("月亮：方位角 %.2f°，高度角 %.2f°，距离约 %.0f km", moonAzDeg, moonAltDeg, moonDistKm)
+	logInfof("太阳：方位角 %.2f°（%s），高度角 %.2f°，距离约 %.0f km", sunAzDeg, describeAzimuth(sunAzDeg), sunAltDeg, sunDistKm)
+	logInfof("月亮：方位角 %.2f°（%s），高度角 %.2f°，距离约 %.0f km", moonAzDeg, describeAzimuth(moonAzDeg), moonAltDeg, moonDistKm)
 	fmt.Println("-------------------------------------------------")
+}
+
+// runLivePositions 按指定间隔持续输出实时太阳/月亮位置，直到收到终止信号。
+func runLivePositions(ctx *CityContext, interval time.Duration) error {
+	if interval <= 0 {
+		interval = 5 * time.Second
+	}
+
+	fmt.Printf("实时模式开启：每隔 %s 输出一次（按 Ctrl+C 退出）\n", interval)
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(stop)
+
+	for {
+		ctx.Now = app.now().In(ctx.Loc)
+		printSunMoonPosition(ctx)
+
+		select {
+		case sig := <-stop:
+			logInfof("收到信号 %s，退出实时模式。", sig)
+			return nil
+		case <-ticker.C:
+		}
+	}
 }
 
 // sanitizeFileName 清理文件名中的非法分隔符。
@@ -1464,6 +1552,9 @@ var rootCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
+		if config.LiveOnly {
+			return runLivePositions(ctx, config.LiveInterval)
+		}
 		return runYear(ctx, OutputOptions{Format: config.Format, AllowOverwrite: config.AllowOverwrite, OutDir: config.OutDir})
 	},
 }
@@ -1480,6 +1571,9 @@ var yearCmd = &cobra.Command{
 		ctx, err := prepareCity(city, config.Offline)
 		if err != nil {
 			return err
+		}
+		if config.LiveOnly {
+			return runLivePositions(ctx, config.LiveInterval)
 		}
 		return runYear(ctx, OutputOptions{Format: config.Format, AllowOverwrite: config.AllowOverwrite, OutDir: config.OutDir})
 	},
@@ -1501,6 +1595,9 @@ var dayCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
+		if config.LiveOnly {
+			return runLivePositions(ctx, config.LiveInterval)
+		}
 		return runDay(ctx, dayDate, OutputOptions{Format: config.Format, AllowOverwrite: config.AllowOverwrite, OutDir: config.OutDir})
 	},
 }
@@ -1520,6 +1617,9 @@ var rangeCmd = &cobra.Command{
 		ctx, err := prepareCity(city, config.Offline)
 		if err != nil {
 			return err
+		}
+		if config.LiveOnly {
+			return runLivePositions(ctx, config.LiveInterval)
 		}
 		return runRange(ctx, rangeFromS, rangeToS, OutputOptions{Format: config.Format, AllowOverwrite: config.AllowOverwrite, OutDir: config.OutDir})
 	},
@@ -1560,6 +1660,10 @@ var coordsCmd = &cobra.Command{
 		fmt.Printf("当前当地时间: %s\n", now.Format("2006-01-02 15:04:05"))
 		fmt.Println("-------------------------------------------------")
 		printSunMoonPosition(ctx)
+
+		if config.LiveOnly {
+			return runLivePositions(ctx, config.LiveInterval)
+		}
 
 		mode := strings.ToLower(coordsMode)
 		if mode == "" {
@@ -1715,6 +1819,8 @@ func init() {
 	rootCmd.PersistentFlags().StringVar(&logLevelFlag, "log-level", config.LogLevel, "日志级别：debug/info/warn/error")
 	rootCmd.PersistentFlags().BoolVar(&logJSONFlag, "log-json", config.LogJSON, "日志使用 JSON 格式输出")
 	rootCmd.PersistentFlags().BoolVar(&logQuietFlag, "log-quiet", config.LogQuiet, "禁用日志输出")
+	rootCmd.PersistentFlags().BoolVar(&config.LiveOnly, "live", false, "实时模式：仅输出太阳/月亮位置，跳过文件生成")
+	rootCmd.PersistentFlags().DurationVar(&config.LiveInterval, "live-interval", config.LiveInterval, "实时模式输出间隔，例如 5s、10s")
 
 	dayCmd.Flags().StringVarP(&dayDate, "date", "d", "", "指定日期（格式：YYYY-MM-DD）")
 	rangeCmd.Flags().StringVar(&rangeFromS, "from", "", "起始日期（格式：YYYY-MM-DD）")

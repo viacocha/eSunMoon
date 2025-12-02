@@ -50,6 +50,12 @@ eSunMoon 是一个使用 Go 开发的天文数据生成工具，基于给定城�
 
 esunmoon 北京
 
+实时模式（仅输出实时方位/高度，默认 5 秒刷新，可指定 --live-interval）
+
+esunmoon 北京 --live
+esunmoon 北京 --live --live-interval=10s
+esunmoon coords --lat 39.9 --lon 116.4 --tz Asia/Shanghai --live
+
 经纬度直输模式（跳过 geocode）
 
 esunmoon coords \

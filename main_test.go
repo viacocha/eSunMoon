@@ -100,6 +100,24 @@ func TestParseDateInLocation(t *testing.T) {
 	}
 }
 
+func TestDescribeAzimuth(t *testing.T) {
+	cases := []struct {
+		azDeg float64
+		want  string
+	}{
+		{0, "正南"},
+		{-81.4, "正东略微偏南"},
+		{-180, "正北"},
+		{90, "正西"},
+		{-8, "正南略微偏东"},
+	}
+	for _, c := range cases {
+		if got := describeAzimuth(c.azDeg); got != c.want {
+			t.Errorf("describeAzimuth(%v) = %q, want %q", c.azDeg, got, c.want)
+		}
+	}
+}
+
 //
 // ----------- 缓存相关测试（使用临时 HOME 目录） -----------
 //
@@ -240,6 +258,38 @@ func TestGenerateAstroDataInvalidDays(t *testing.T) {
 	_, err = generateAstroData("TestCity", 0, 0, loc, start, -1)
 	if err == nil {
 		t.Error("expected error for negative days, got nil")
+	}
+}
+
+func TestRunLivePositionsStopsOnSignal(t *testing.T) {
+	loc, _ := time.LoadLocation("UTC")
+	ctx := &CityContext{
+		City:        "TestCity",
+		DisplayName: "TestCity",
+		Lat:         0,
+		Lon:         0,
+		TZID:        "UTC",
+		Loc:         loc,
+		Now:         time.Now().In(loc),
+	}
+
+	// 加快测试节奏
+	done := make(chan error, 1)
+	go func() {
+		done <- runLivePositions(ctx, 10*time.Millisecond)
+	}()
+
+	// 在短暂等待后发送 SIGINT，触发退出
+	time.Sleep(30 * time.Millisecond)
+	_ = syscall.Kill(syscall.Getpid(), syscall.SIGINT)
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("runLivePositions returned error: %v", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("runLivePositions did not stop after signal")
 	}
 }
 
