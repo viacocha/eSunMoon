@@ -86,6 +86,13 @@ func TestFormatTimeLocal(t *testing.T) {
 	}
 }
 
+func TestParseDateInLocationInvalid(t *testing.T) {
+	loc := time.FixedZone("TEST", 0)
+	if _, err := parseDateInLocation("2025-13-40", loc); err == nil {
+		t.Fatalf("expected error for invalid date format")
+	}
+}
+
 func TestParseDateInLocation(t *testing.T) {
 	loc := time.FixedZone("TEST", 8*3600)
 	tm, err := parseDateInLocation("2025-01-02", loc)
@@ -117,6 +124,13 @@ func TestDescribeAzimuth(t *testing.T) {
 		if got := describeAzimuth(c.azDeg); got != c.want {
 			t.Errorf("describeAzimuth(%v) = %q, want %q", c.azDeg, got, c.want)
 		}
+	}
+}
+
+func TestSanitizeFileName(t *testing.T) {
+	in := "  foo/bar\\baz  "
+	if got := sanitizeFileName(in); got != "foo-bar-baz" {
+		t.Fatalf("sanitizeFileName(%q) = %q, want %q", in, got, "foo-bar-baz")
 	}
 }
 

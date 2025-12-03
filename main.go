@@ -1571,6 +1571,7 @@ func positionsPageHandler(w http.ResponseWriter, r *http.Request) {
     .controls input { padding:6px 8px; border-radius:10px; border:1px solid rgba(255,255,255,0.18); background:rgba(255,255,255,0.06); color:#e4f1ff; }
     .controls button { padding:9px 12px; border-radius:10px; border:1px solid rgba(255,255,255,0.2); background: linear-gradient(135deg, #2f80ed, #56ccf2); color:white; cursor:pointer; font-weight:600; box-shadow:0 12px 26px rgba(47,128,237,0.35); }
     .controls button:hover { filter:brightness(1.06); }
+    .controls button:focus { outline:2px solid rgba(138,199,255,0.7); outline-offset:2px; }
     canvas { width:100%%; max-width:1120px; height:auto; display:block; margin:8px auto 12px; border-radius:16px; background: radial-gradient(circle at 52%% 30%%, rgba(255,255,255,0.08), rgba(0,0,0,0.5)); box-shadow: 0 22px 60px rgba(0,0,0,0.5); }
     .info { display:grid; grid-template-columns:repeat(auto-fit, minmax(260px, 1fr)); gap:12px; color:#d9e6ff; font-size:14px; }
     .badge { display:inline-block; padding:4px 10px; border-radius:999px; background:rgba(255,255,255,0.08); margin-right:8px; font-size:12px; color:#8ac7ff; }
@@ -1599,12 +1600,21 @@ func positionsPageHandler(w http.ResponseWriter, r *http.Request) {
         <label><input type="number" id="refreshInput" style="width:80px" min="5" step="1" value="%d"> 秒</label>
         <button id="refreshNow">立即刷新</button>
         <button id="clearTrack">清空轨迹</button>
+        <span class="badge">轨迹窗口</span>
+        <select id="trackWindow" style="padding:7px 10px; border-radius:10px; background:rgba(255,255,255,0.06); color:#e4f1ff; border:1px solid rgba(255,255,255,0.2);">
+          <option value="300">5 分钟</option>
+          <option value="1800" selected>30 分钟</option>
+          <option value="7200">120 分钟</option>
+        </select>
+        <label class="badge">自定义(分)<input type="number" id="trackCustom" style="width:70px; margin-left:6px;" min="1" step="1" value="30"></label>
+        <button id="toggleTrack">暂停轨迹</button>
         <span class="muted" id="status">等待首次拉取...</span>
       </div>
       <div class="muted" style="font-size:12px; margin:4px 0 10px;">
         <span class="badge">API</span>
         <span id="apiPreview"></span>
         <button id="copyApi" style="padding:6px 8px; margin-left:8px;">复制链接</button>
+        <button id="copyCurl" style="padding:6px 8px; margin-left:8px;">复制 curl</button>
       </div>
       <canvas id="compass" width="1080" height="640"></canvas>
       <canvas id="altitude" width="1080" height="220"></canvas>
@@ -1635,7 +1645,8 @@ func positionsPageHandler(w http.ResponseWriter, r *http.Request) {
     const sunTrack = [];
     const moonTrack = [];
     const trackLimit = 300;
-    const trackWindowMs = 30 * 60 * 1000;
+    let trackWindowMs = 30 * 60 * 1000;
+    let trackRecording = true;
 
     const compassCanvas = document.getElementById("compass");
     const compassCtx = compassCanvas.getContext("2d");
@@ -1645,7 +1656,12 @@ func positionsPageHandler(w http.ResponseWriter, r *http.Request) {
     const citySelect = document.getElementById("citySelect");
 
     const deg = Math.PI / 180;
-    const headingFromAz = (azDeg) => (azDeg + 180) %% 360; // 数据 0=南，转为 0=北 顺时针
+    // 原始方位：南=0，东=-90，西=+90，北=±180
+    const normRawAz = (azDeg) => {
+      // 数据原始定义：南=0，东=-90，西=+90，北=±180
+      let a = ((azDeg + 180) %% 360 + 360) %% 360; // 0~360
+      return a - 180; // -180~180（南=0，东=-90，西=+90，北=±180）
+    };
 
     function hexToRgb(hex) {
       const res = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
@@ -1659,7 +1675,8 @@ func positionsPageHandler(w http.ResponseWriter, r *http.Request) {
 
     function azToXY(azDeg, r) {
       const rad = azDeg * deg;
-      return { x: r * Math.sin(rad), y: -r * Math.cos(rad) }; // 北在上
+      // 上南下北 左东右西：使用原始 az（南=0，东=-90，西=+90，北=±180）
+      return { x: r * Math.sin(rad), y: -r * Math.cos(rad) };
     }
 
     function drawBackdrop(ctx, cx, cy, r) {
@@ -1689,11 +1706,24 @@ func positionsPageHandler(w http.ResponseWriter, r *http.Request) {
       });
       compassCtx.setLineDash([]);
 
+      // 加粗主刻度并增加 30/60 度刻度
+      const tickAz = [0, -90, 90, 180, -180, -60, -30, 30, 60, 120, 150, -120, -150];
+      tickAz.forEach(az => {
+        const p = azToXY(az, r);
+        const q = azToXY(az, r * 0.92);
+        compassCtx.strokeStyle = Math.abs(az) === 90 || az === 0 || Math.abs(az) === 180 ? "rgba(255,255,255,0.9)" : "rgba(255,255,255,0.55)";
+        compassCtx.lineWidth = Math.abs(az) === 90 || az === 0 || Math.abs(az) === 180 ? 2.4 : 1.2;
+        compassCtx.beginPath();
+        compassCtx.moveTo(cx + p.x, cy + p.y);
+        compassCtx.lineTo(cx + q.x, cy + q.y);
+        compassCtx.stroke();
+      });
+
       const dirs = [
-        { text: "北", az: 0 },
-        { text: "东", az: 90 },
-        { text: "南", az: 180 },
-        { text: "西", az: 270 },
+        { text: "南", az: 0 },
+        { text: "东", az: -90 },
+        { text: "北", az: 180 },
+        { text: "西", az: 90 },
       ];
       compassCtx.font = "13px 'Segoe UI', Arial";
       compassCtx.fillStyle = "rgba(255,255,255,0.9)";
@@ -1718,23 +1748,18 @@ func positionsPageHandler(w http.ResponseWriter, r *http.Request) {
     function drawTrackCompass(track, r, color, cx, cy) {
       if (track.length < 2) return;
       const rgb = hexToRgb(color);
-      for (let i = 1; i < track.length; i++) {
-        const p0 = azToXY(track[i - 1].heading, r);
-        const p1 = azToXY(track[i].heading, r);
-        const alpha = 0.25 + 0.55 * (i / (track.length - 1));
-        compassCtx.strokeStyle = "rgba(" + rgb.r + "," + rgb.g + "," + rgb.b + "," + alpha.toFixed(3) + ")";
-        compassCtx.lineWidth = 1.8;
-        compassCtx.setLineDash([]);
+      for (let i = 0; i < track.length; i++) {
+        const p = azToXY(track[i].azRaw, r);
+        const alpha = 0.25 + 0.55 * (i / (track.length - 1 || 1));
+        compassCtx.fillStyle = "rgba(" + rgb.r + "," + rgb.g + "," + rgb.b + "," + alpha.toFixed(3) + ")";
         compassCtx.beginPath();
-        compassCtx.moveTo(cx + p0.x, cy + p0.y);
-        compassCtx.lineTo(cx + p1.x, cy + p1.y);
-        compassCtx.stroke();
+        compassCtx.arc(cx + p.x, cy + p.y, 3.5, 0, Math.PI * 2);
+        compassCtx.fill();
       }
     }
 
     function drawBody(body, r, color, label, sizeFactor, cx, cy, baseR) {
-      const heading = headingFromAz(body.azimuth_deg);
-      const pos = azToXY(heading, r);
+      const pos = azToXY(body.azimuth_deg, r);
       const x = cx + pos.x;
       const y = cy + pos.y;
 
@@ -1756,10 +1781,6 @@ func positionsPageHandler(w http.ResponseWriter, r *http.Request) {
       compassCtx.lineTo(x, y - altLen);
       compassCtx.stroke();
       compassCtx.setLineDash([]);
-      compassCtx.fillStyle = color;
-      compassCtx.font = "13px 'Segoe UI', Arial";
-      compassCtx.fillText(body.altitude_deg.toFixed(1) + "°", x + 8, y - altLen - 6);
-
       const outerBase = 19;
       const innerBase = 11;
       const glowBase = 26;
@@ -1783,18 +1804,50 @@ func positionsPageHandler(w http.ResponseWriter, r *http.Request) {
       compassCtx.fill();
       compassCtx.shadowBlur = 0;
 
-      compassCtx.fillText(label + " / 方位 " + body.azimuth_deg.toFixed(1) + "°", x + outer + 6, y - 6);
+      // 标签：天体名 + 高度角，自动避让
+      const a = ((body.azimuth_deg %% 360) + 360) %% 360;
+      let dx = outer + 6;
+      let dy = -6;
+      let align = "left";
+      if (a >= 315 || a < 45) { // 朝南（画布上方）
+        dx = 0; dy = -(outer + 12); align = "center";
+      } else if (a >= 45 && a < 135) { // 朝东（右侧）
+        dx = outer + 10; dy = 4; align = "left";
+      } else if (a >= 135 && a < 225) { // 朝北（画布下方）
+        dx = 0; dy = outer + 18; align = "center";
+      } else { // 朝西（左侧）
+        dx = -(outer + 10); dy = 4; align = "right";
+      }
+      compassCtx.textAlign = align;
+      compassCtx.textBaseline = "middle";
+      const labelText = label + " " + body.altitude_deg.toFixed(1) + "°";
+      compassCtx.fillText(labelText, x + dx, y + dy);
+      compassCtx.textAlign = "left";
+      compassCtx.textBaseline = "alphabetic";
     }
 
     function drawAltitudeView(data, baseR, sunTrackData, moonTrackData) {
       const w = altCanvas.width;
       const h = altCanvas.height;
-      const margin = 26;
-      const zeroY = h - margin;
-      const maxAlt = 90;
+      // 加大留白避免标签与刻度重叠
+      const margin = 62;
+      const altTickX = margin + 6; // 再向右移，确保与标题分离
+      const altTitleX = margin - 32; // 轴标题位置（保持在画布内且不与刻度重叠）
+      const altMin = -90;
+      const altMax = 90;
+      const headMin = -180;
+      const headMax = 180;
 
       altCtx.fillStyle = "rgba(255,255,255,0.06)";
       altCtx.fillRect(0, 0, w, h);
+
+      // 背景色块，辅助区分东/西和正/负高度
+      altCtx.fillStyle = "rgba(104,168,255,0.06)"; // 东侧
+      altCtx.fillRect(margin, margin, (w - margin * 2) / 2, h - margin * 2);
+      altCtx.fillStyle = "rgba(255,196,120,0.06)"; // 西侧
+      altCtx.fillRect(margin + (w - margin * 2) / 2, margin, (w - margin * 2) / 2, h - margin * 2);
+      altCtx.fillStyle = "rgba(140,255,180,0.05)"; // 正高度
+      altCtx.fillRect(margin, margin, w - margin * 2, (h - margin * 2) / 2);
 
       // 背景渐变
       const g = altCtx.createLinearGradient(0, h, 0, 0);
@@ -1803,18 +1856,39 @@ func positionsPageHandler(w http.ResponseWriter, r *http.Request) {
       altCtx.fillStyle = g;
       altCtx.fillRect(0, 0, w, h);
 
-      altCtx.strokeStyle = "rgba(255,255,255,0.22)";
-      altCtx.lineWidth = 1.2;
-      altCtx.beginPath();
-      altCtx.moveTo(margin, zeroY);
-      altCtx.lineTo(w - margin, zeroY);
-      altCtx.stroke();
+      // 坐标转换：heading(-180~180) -> x, alt -> y
+      const toX = (headingSigned) => {
+        const hNorm = Math.max(headMin, Math.min(headMax, headingSigned));
+        return margin + ((hNorm - headMin) / (headMax - headMin)) * (w - margin * 2);
+      };
+      const toY = (alt) => {
+        const a = Math.max(altMin, Math.min(altMax, alt));
+        return margin + ((altMax - a) / (altMax - altMin)) * (h - margin * 2);
+      };
 
-      // 网格线
-      [15, 30, 45, 60, 75, 90].forEach((alt, idx) => {
-        const y = zeroY - (alt / maxAlt) * (h - margin * 2);
-        altCtx.setLineDash(idx %% 2 === 0 ? [4, 6] : []);
-        altCtx.strokeStyle = idx === 5 ? "rgba(255,255,255,0.25)" : "rgba(255,255,255,0.15)";
+      // 网格线（垂直：方位；水平：高度）
+      const headingLines = [-180, -90, -45, 0, 45, 90, 180];
+      headingLines.forEach((hdg, idx) => {
+        const x = toX(hdg);
+        altCtx.setLineDash(idx === 3 ? [] : [4, 6]);
+        altCtx.strokeStyle = idx === 3 ? "rgba(255,255,255,0.28)" : "rgba(255,255,255,0.14)";
+        altCtx.lineWidth = idx === 3 ? 1.6 : 1.1;
+        altCtx.beginPath();
+        altCtx.moveTo(x, margin);
+        altCtx.lineTo(x, h - margin);
+        altCtx.stroke();
+        altCtx.setLineDash([]);
+        altCtx.fillStyle = "rgba(255,255,255,0.85)";
+        altCtx.font = "12px 'Segoe UI', Arial";
+        altCtx.fillText(hdg + "°", x - 18, h - margin + 24);
+      });
+
+      const altLines = [-90, -60, -30, 0, 30, 60, 90];
+      altLines.forEach((alt, idx) => {
+        const y = toY(alt);
+        altCtx.setLineDash(idx === 3 ? [] : [4, 6]);
+        altCtx.strokeStyle = idx === 3 ? "rgba(255,255,255,0.28)" : "rgba(255,255,255,0.14)";
+        altCtx.lineWidth = idx === 3 ? 1.6 : 1.1;
         altCtx.beginPath();
         altCtx.moveTo(margin, y);
         altCtx.lineTo(w - margin, y);
@@ -1822,8 +1896,25 @@ func positionsPageHandler(w http.ResponseWriter, r *http.Request) {
         altCtx.setLineDash([]);
         altCtx.fillStyle = "rgba(255,255,255,0.85)";
         altCtx.font = "12px 'Segoe UI', Arial";
-        altCtx.fillText(alt + "°", 6, y + 4);
+        altCtx.textAlign = "right";
+        altCtx.textBaseline = "middle";
+        altCtx.fillText(alt + "°", altTickX, y);
+        altCtx.textAlign = "left";
+        altCtx.textBaseline = "alphabetic";
       });
+
+      // 坐标轴标签
+      altCtx.fillStyle = "rgba(200,220,255,0.9)";
+      altCtx.font = "13px 'Segoe UI', Arial";
+      altCtx.textAlign = "left";
+      altCtx.textBaseline = "alphabetic";
+      altCtx.fillText("方位角 (-180° ~ +180°，南=0，东=-90，西=+90，北=±180)", margin + 12, h - 18);
+      altCtx.save();
+      altCtx.translate(altTitleX, h / 2);
+      altCtx.rotate(-Math.PI / 2);
+      altCtx.textAlign = "center";
+      altCtx.fillText("高度角 (-90° ~ +90°)", 0, 0);
+      altCtx.restore();
 
       const slots = [
         { obj: data.sun, color: "#ffd166", label: "太阳", x: w * 0.32 },
@@ -1833,62 +1924,62 @@ func positionsPageHandler(w http.ResponseWriter, r *http.Request) {
       function drawAltTrack(track, color) {
         if (track.length < 2) return;
         const rgb = hexToRgb(color);
-        altCtx.setLineDash([]);
-        altCtx.lineWidth = 2;
-        altCtx.beginPath();
         const baseTs = track[0].ts;
         const lastTs = track[track.length - 1].ts || baseTs;
         const span = Math.max(1, lastTs-baseTs);
         track.forEach((pt, idx) => {
-          const alt = Math.max(-10, Math.min(90, pt.alt));
-          const y = zeroY - (alt / maxAlt) * (h - margin * 2);
-          const x = margin + ((pt.ts - baseTs) / span) * (w - margin * 2);
-          if (idx === 0) altCtx.moveTo(x, y);
-          else altCtx.lineTo(x, y);
+          const alt = Math.max(altMin, Math.min(altMax, pt.alt));
+          const headingSigned = normRawAz(pt.azRaw);
+          const y = toY(alt);
+          const x = toX(headingSigned);
           const alpha = 0.25 + 0.6 * (idx / (track.length - 1 || 1));
-          altCtx.strokeStyle = "rgba(" + rgb.r + "," + rgb.g + "," + rgb.b + "," + alpha.toFixed(3) + ")";
+          altCtx.fillStyle = "rgba(" + rgb.r + "," + rgb.g + "," + rgb.b + "," + alpha.toFixed(3) + ")";
+          altCtx.beginPath();
+          altCtx.arc(x, y, 3.5, 0, Math.PI * 2);
+          altCtx.fill();
         });
-        altCtx.stroke();
       }
 
       drawAltTrack(sunTrackData, "#ffd166");
       drawAltTrack(moonTrackData, "#9ad1ff");
 
       slots.forEach(slot => {
-        const alt = Math.max(-10, Math.min(90, slot.obj.altitude_deg));
-        const y = zeroY - (alt / maxAlt) * (h - margin * 2);
+        const alt = Math.max(altMin, Math.min(altMax, slot.obj.altitude_deg));
+        const headingSigned = normRawAz(slot.obj.azimuth_deg);
+        const y = toY(alt);
+        const x = toX(headingSigned);
 
         altCtx.strokeStyle = slot.color;
         altCtx.lineWidth = 2;
         altCtx.setLineDash([4, 5]);
         altCtx.beginPath();
-        altCtx.moveTo(slot.x, zeroY);
-        altCtx.lineTo(slot.x, y);
+        altCtx.moveTo(x, toY(0)); // 辅助线到高度 0
+        altCtx.lineTo(x, y);
         altCtx.stroke();
         altCtx.setLineDash([]);
 
         const outer = 14;
         const inner = 8;
-        const glow = altCtx.createRadialGradient(slot.x, y, 0, slot.x, y, 24);
+        const glow = altCtx.createRadialGradient(x, y, 0, x, y, 24);
         glow.addColorStop(0, slot.color);
         glow.addColorStop(1, "rgba(0,0,0,0)");
         altCtx.fillStyle = glow;
         altCtx.beginPath();
-        altCtx.arc(slot.x, y, outer, 0, Math.PI * 2);
+        altCtx.arc(x, y, outer, 0, Math.PI * 2);
         altCtx.fill();
 
         altCtx.shadowColor = slot.color;
         altCtx.shadowBlur = 12;
         altCtx.fillStyle = slot.color;
         altCtx.beginPath();
-        altCtx.arc(slot.x, y, inner, 0, Math.PI * 2);
+        altCtx.arc(x, y, inner, 0, Math.PI * 2);
         altCtx.fill();
         altCtx.shadowBlur = 0;
 
-        altCtx.fillStyle = slot.color;
-        altCtx.font = "13px 'Segoe UI', Arial";
-        const text = slot.label + " 高度 " + slot.obj.altitude_deg.toFixed(1) + "° / 方位 " + slot.obj.azimuth_deg.toFixed(1) + "°";
-        altCtx.fillText(text, slot.x + 14, y + 4);
+      altCtx.fillStyle = slot.color;
+      altCtx.font = "13px 'Segoe UI', Arial";
+      const text = slot.label + " 高度 " + slot.obj.altitude_deg.toFixed(1) + "° / 方位(南=0) " + headingSigned.toFixed(1) + "°";
+      altCtx.fillText(text, x + 14, y + 4);
       });
     }
 
@@ -1943,10 +2034,8 @@ func positionsPageHandler(w http.ResponseWriter, r *http.Request) {
         const data = await res.json();
 
         const nowTs = Date.now();
-        const sunHeading = headingFromAz(data.sun.azimuth_deg);
-        const moonHeading = headingFromAz(data.moon.azimuth_deg);
-        sunTrack.push({ heading: sunHeading, alt: data.sun.altitude_deg, ts: nowTs });
-        moonTrack.push({ heading: moonHeading, alt: data.moon.altitude_deg, ts: nowTs });
+        sunTrack.push({ azRaw: data.sun.azimuth_deg, alt: data.sun.altitude_deg, ts: nowTs });
+        moonTrack.push({ azRaw: data.moon.azimuth_deg, alt: data.moon.altitude_deg, ts: nowTs });
         const cutoff = nowTs - trackWindowMs;
         while (sunTrack.length > trackLimit || (sunTrack[0] && sunTrack[0].ts < cutoff)) sunTrack.shift();
         while (moonTrack.length > trackLimit || (moonTrack[0] && moonTrack[0].ts < cutoff)) moonTrack.shift();
@@ -2016,6 +2105,7 @@ func positionsPageHandler(w http.ResponseWriter, r *http.Request) {
       sunTrack.length = 0;
       moonTrack.length = 0;
       fetchAndDraw();
+      document.getElementById("status").textContent = "轨迹已重置";
     });
 
     document.getElementById("copyApi").addEventListener("click", async () => {
@@ -2025,6 +2115,39 @@ func positionsPageHandler(w http.ResponseWriter, r *http.Request) {
       } catch (err) {
         document.getElementById("status").textContent = "复制失败";
       }
+    });
+
+    document.getElementById("copyCurl").addEventListener("click", async () => {
+      try {
+        const cmd = "curl -X GET \"" + buildApiUrl() + "\"";
+        await navigator.clipboard.writeText(cmd);
+        document.getElementById("status").textContent = "已复制 curl";
+      } catch (err) {
+        document.getElementById("status").textContent = "复制失败";
+      }
+    });
+
+    document.getElementById("trackWindow").addEventListener("change", (e) => {
+      const secs = Number(e.target.value);
+      if (Number.isFinite(secs) && secs > 0) {
+        trackWindowMs = secs * 1000;
+      }
+    });
+
+    document.getElementById("trackCustom").addEventListener("change", (e) => {
+      const mins = Number(e.target.value);
+      if (Number.isFinite(mins) && mins > 0) {
+        trackWindowMs = mins * 60 * 1000;
+        document.getElementById("trackWindow").value = "";
+      } else {
+        e.target.value = 30;
+      }
+    });
+
+    document.getElementById("toggleTrack").addEventListener("click", () => {
+      trackRecording = !trackRecording;
+      document.getElementById("toggleTrack").textContent = trackRecording ? "暂停轨迹" : "继续轨迹";
+      document.getElementById("status").textContent = trackRecording ? "轨迹记录中" : "轨迹已暂停";
     });
 
     const allCities = [];
