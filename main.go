@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"log"
 	"math"
@@ -15,6 +16,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -92,6 +94,7 @@ var builtinAliases = map[string][]string{
 }
 
 const polarNote = "HasSunrise/HasSunset/HasDayLength 标志指示极昼/极夜等情况，false 表示当日无对应事件"
+const defaultPositionsRefresh = 30 * time.Second
 
 // -------------------- 工具函数 --------------------
 
@@ -1316,6 +1319,35 @@ type astroAPIResponse struct {
 	Notes      []string     `json:"notes,omitempty"`
 }
 
+type bodyPosition struct {
+	AzimuthDeg  float64 `json:"azimuth_deg"`
+	AzimuthText string  `json:"azimuth_text"`
+	AltitudeDeg float64 `json:"altitude_deg"`
+	DistanceKm  float64 `json:"distance_km"`
+}
+
+type livePositionsResponse struct {
+	City      string       `json:"city"`
+	Display   string       `json:"display"`
+	Lat       float64      `json:"lat"`
+	Lon       float64      `json:"lon"`
+	Timezone  string       `json:"timezone"`
+	Generated string       `json:"generated_at"`
+	LocalTime string       `json:"local_time"`
+	Sun       bodyPosition `json:"sun"`
+	Moon      bodyPosition `json:"moon"`
+}
+
+type cachedCity struct {
+	City        string   `json:"city"`
+	DisplayName string   `json:"display_name"`
+	Lat         float64  `json:"lat"`
+	Lon         float64  `json:"lon"`
+	TimezoneID  string   `json:"timezone_id"`
+	Aliases     []string `json:"aliases,omitempty"`
+	UpdatedAt   string   `json:"updated_at"`
+}
+
 // readyHandler 检查基本就绪状态（缓存目录可写）。
 func readyHandler(w http.ResponseWriter, r *http.Request) {
 	dir := filepath.Dir(cacheFilePath())
@@ -1358,46 +1390,31 @@ func serveWithGracefulShutdown(addr string, handler http.Handler, stop <-chan os
 	}
 }
 
-// astroAPIHandler 处理 /api/astro 请求，支持城市或坐标查询。
-func astroAPIHandler(w http.ResponseWriter, r *http.Request) {
-	q := r.URL.Query()
-	mode := strings.ToLower(q.Get("mode"))
-	if mode == "" {
-		mode = "year"
-	}
-
-	// 优先走 coords 模式：lat+lon+tz
+// resolveContextFromQuery 根据查询参数获取城市上下文，支持 lat/lon/tz 或 city。
+func resolveContextFromQuery(q url.Values) (*CityContext, int, error) {
 	latStr := q.Get("lat")
 	lonStr := q.Get("lon")
 	tzID := q.Get("tz")
-
-	var (
-		ctx *CityContext
-		err error
-	)
 
 	if latStr != "" && lonStr != "" && tzID != "" {
 		lat, err1 := strconv.ParseFloat(latStr, 64)
 		lon, err2 := strconv.ParseFloat(lonStr, 64)
 		if err1 != nil || err2 != nil {
-			http.Error(w, "lat/lon 解析失败", http.StatusBadRequest)
-			return
+			return nil, http.StatusBadRequest, errors.New("lat/lon 解析失败")
 		}
 		if lat < -90 || lat > 90 || lon < -180 || lon > 180 {
-			http.Error(w, "lat/lon 超出范围", http.StatusBadRequest)
-			return
+			return nil, http.StatusBadRequest, errors.New("lat/lon 超出范围")
 		}
 		loc, err := time.LoadLocation(tzID)
 		if err != nil {
-			http.Error(w, "tz 加载失败: "+err.Error(), http.StatusBadRequest)
-			return
+			return nil, http.StatusBadRequest, fmt.Errorf("tz 加载失败: %w", err)
 		}
-		now := time.Now().In(loc)
+		now := app.now().In(loc)
 		cityName := q.Get("city")
 		if cityName == "" {
 			cityName = fmt.Sprintf("coords_%.4f_%.4f", lat, lon)
 		}
-		ctx = &CityContext{
+		ctx := &CityContext{
 			City:        cityName,
 			DisplayName: cityName,
 			Lat:         lat,
@@ -1406,18 +1423,665 @@ func astroAPIHandler(w http.ResponseWriter, r *http.Request) {
 			Loc:         loc,
 			Now:         now,
 		}
-	} else {
-		// 其次走城市名模式
-		city := q.Get("city")
-		if city == "" {
-			http.Error(w, "必须提供 city 或 lat+lon+tz 参数", http.StatusBadRequest)
-			return
+		return ctx, http.StatusOK, nil
+	}
+
+	city := q.Get("city")
+	if city == "" {
+		return nil, http.StatusBadRequest, errors.New("必须提供 city 或 lat+lon+tz 参数")
+	}
+	ctx, err := prepareCity(city, config.Offline)
+	if err != nil {
+		return nil, http.StatusBadRequest, fmt.Errorf("城市解析失败: %w", err)
+	}
+	return ctx, http.StatusOK, nil
+}
+
+// buildLivePositions 返回当前时刻的太阳、月亮位置。
+func buildLivePositions(ctx *CityContext) livePositionsResponse {
+	now := app.now().In(ctx.Loc)
+	ctx.Now = now
+
+	sunPos := suncalc.GetPosition(now, ctx.Lat, ctx.Lon)
+	moonPos := suncalc.GetMoonPosition(now, ctx.Lat, ctx.Lon)
+
+	sunAz := radToDeg(sunPos.Azimuth)
+	sunAlt := radToDeg(sunPos.Altitude)
+	moonAz := radToDeg(moonPos.Azimuth)
+	moonAlt := radToDeg(moonPos.Altitude)
+
+	return livePositionsResponse{
+		City:      ctx.City,
+		Display:   ctx.DisplayName,
+		Lat:       ctx.Lat,
+		Lon:       ctx.Lon,
+		Timezone:  ctx.TZID,
+		Generated: now.Format(time.RFC3339),
+		LocalTime: now.Format("2006-01-02 15:04:05"),
+		Sun: bodyPosition{
+			AzimuthDeg:  sunAz,
+			AzimuthText: describeAzimuth(sunAz),
+			AltitudeDeg: sunAlt,
+			DistanceKm:  earthSunDistanceKm(now),
+		},
+		Moon: bodyPosition{
+			AzimuthDeg:  moonAz,
+			AzimuthText: describeAzimuth(moonAz),
+			AltitudeDeg: moonAlt,
+			DistanceKm:  moonPos.Distance,
+		},
+	}
+}
+
+// positionsAPIHandler 提供当前太阳/月亮位置 JSON。
+func positionsAPIHandler(w http.ResponseWriter, r *http.Request) {
+	ctx, status, err := resolveContextFromQuery(r.URL.Query())
+	if err != nil {
+		http.Error(w, err.Error(), status)
+		return
+	}
+
+	resp := buildLivePositions(ctx)
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	_ = enc.Encode(resp)
+}
+
+// citiesAPIHandler 返回缓存中的城市列表，供前端选择。
+func citiesAPIHandler(w http.ResponseWriter, r *http.Request) {
+	cache := loadCache()
+	var list []cachedCity
+	for _, e := range cache.Entries {
+		list = append(list, cachedCity{
+			City:        e.City,
+			DisplayName: e.DisplayName,
+			Lat:         e.Lat,
+			Lon:         e.Lon,
+			TimezoneID:  e.TimezoneID,
+			Aliases:     e.Aliases,
+			UpdatedAt:   e.UpdatedAt,
+		})
+	}
+	sort.Slice(list, func(i, j int) bool {
+		return strings.ToLower(list[i].DisplayName) < strings.ToLower(list[j].DisplayName)
+	})
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	_ = enc.Encode(list)
+}
+
+// positionsPageHandler 提供一个 2D 可视化页面，周期性拉取 /api/positions。
+func positionsPageHandler(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	apiQuery := r.URL.Query()
+	apiQuery.Del("refresh")
+
+	// 将 city 从基础查询中剥离，用于下拉选择。
+	initialCity := apiQuery.Get("city")
+	apiQuery.Del("city")
+
+	apiURL := "/api/positions"
+	apiQueryWithCity := url.Values{}
+	for k, vs := range apiQuery {
+		apiQueryWithCity[k] = append([]string(nil), vs...)
+	}
+	if initialCity != "" {
+		apiQueryWithCity.Set("city", initialCity)
+	}
+	if encoded := apiQueryWithCity.Encode(); encoded != "" {
+		apiURL += "?" + encoded
+	}
+
+	baseQuery := apiQuery.Encode()
+
+	refreshSec := int(defaultPositionsRefresh / time.Second)
+	if v := q.Get("refresh"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			refreshSec = n
 		}
-		ctx, err = prepareCity(city, config.Offline)
-		if err != nil {
-			http.Error(w, "城市解析失败: "+err.Error(), http.StatusBadRequest)
-			return
-		}
+	}
+
+	title := "eSunMoon 太阳/月亮实时 2D 视图"
+	if city := q.Get("city"); city != "" {
+		title = fmt.Sprintf("%s - %s", title, city)
+	}
+
+	// 页面使用的 positions 接口基准路径，后续由前端补齐查询参数与绝对前缀。
+	apiBasePath := "/api/positions"
+
+	htmlStr := fmt.Sprintf(`<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>%s</title>
+  <style>
+    :root { color-scheme: light; }
+    body { margin:0; padding:0; font-family: "Segoe UI", "Helvetica Neue", Arial, sans-serif; background: radial-gradient(130%% 160%% at 18%% 10%%, #0f2d4f, #071223 55%%, #050914 90%%); color:#e7f2ff; min-height:100vh; }
+    .wrap { max-width:1160px; margin:0 auto; padding:18px 14px; }
+    .card { background: rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.08); border-radius:20px; padding:18px 18px 22px; box-shadow: 0 26px 68px rgba(0,0,0,0.48); backdrop-filter: blur(8px); }
+    h1 { margin:0 0 6px; font-size:25px; letter-spacing: 0.5px; }
+    .subtitle { color:#9fb7d8; margin:0 0 14px; font-size:14px; }
+    .controls { display:flex; flex-wrap:wrap; gap:12px; align-items:center; margin-bottom:14px; }
+    .controls label { font-size:14px; color:#c8dcff; }
+    .controls input { padding:6px 8px; border-radius:10px; border:1px solid rgba(255,255,255,0.18); background:rgba(255,255,255,0.06); color:#e4f1ff; }
+    .controls button { padding:9px 12px; border-radius:10px; border:1px solid rgba(255,255,255,0.2); background: linear-gradient(135deg, #2f80ed, #56ccf2); color:white; cursor:pointer; font-weight:600; box-shadow:0 12px 26px rgba(47,128,237,0.35); }
+    .controls button:hover { filter:brightness(1.06); }
+    canvas { width:100%%; max-width:1120px; height:auto; display:block; margin:8px auto 12px; border-radius:16px; background: radial-gradient(circle at 52%% 30%%, rgba(255,255,255,0.08), rgba(0,0,0,0.5)); box-shadow: 0 22px 60px rgba(0,0,0,0.5); }
+    .info { display:grid; grid-template-columns:repeat(auto-fit, minmax(260px, 1fr)); gap:12px; color:#d9e6ff; font-size:14px; }
+    .badge { display:inline-block; padding:4px 10px; border-radius:999px; background:rgba(255,255,255,0.08); margin-right:8px; font-size:12px; color:#8ac7ff; }
+    .muted { color:#9ab6d8; font-size:13px; }
+    .legend { display:flex; gap:10px; flex-wrap:wrap; margin:6px 0 4px; color:#cfe4ff; font-size:13px; }
+    .legend span { display:flex; align-items:center; gap:6px; }
+    .dot { width:12px; height:12px; border-radius:999px; display:inline-block; }
+    .error { color:#ffb4c2; margin-top:8px; }
+    a { color:#8ac7ff; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h1>太阳 / 月亮 / 地球 2D 双视图</h1>
+      <p class="subtitle">俯视方位盘 + 侧视高度条，一屏同时读方位角与高度角。数据源：/api/positions；默认 30 秒刷新，可调整。</p>
+      <div class="controls">
+        <div id="cityWrap" style="display:none; gap:8px; align-items:center;">
+          <span class="badge">选择城市</span>
+          <input id="cityFilter" placeholder="搜索..." style="width:160px; padding:8px 10px; border-radius:10px; border:1px solid rgba(255,255,255,0.2); background:rgba(255,255,255,0.06); color:#e4f1ff;">
+          <select id="citySelect" style="min-width:220px; padding:8px 10px; border-radius:10px; background:rgba(255,255,255,0.08); color:#e4f1ff; border:1px solid rgba(255,255,255,0.2);">
+            <option value="">加载中...</option>
+          </select>
+        </div>
+        <span class="badge">刷新秒数</span>
+        <label><input type="number" id="refreshInput" style="width:80px" min="5" step="1" value="%d"> 秒</label>
+        <button id="refreshNow">立即刷新</button>
+        <button id="clearTrack">清空轨迹</button>
+        <span class="muted" id="status">等待首次拉取...</span>
+      </div>
+      <div class="muted" style="font-size:12px; margin:4px 0 10px;">
+        <span class="badge">API</span>
+        <span id="apiPreview"></span>
+        <button id="copyApi" style="padding:6px 8px; margin-left:8px;">复制链接</button>
+      </div>
+      <canvas id="compass" width="1080" height="640"></canvas>
+      <canvas id="altitude" width="1080" height="220"></canvas>
+      <div class="legend">
+        <span><span class="dot" style="background:#ffd166;"></span>太阳</span>
+        <span><span class="dot" style="background:#9ad1ff;"></span>月亮</span>
+        <span><span class="dot" style="background:#74c0ff; width:14px; height:4px; border-radius:6px;"></span>方位线</span>
+        <span><span class="dot" style="background:#f8d061; width:14px; height:4px; border-radius:6px;"></span>高度线</span>
+      </div>
+      <div class="info">
+        <div id="sunInfo"></div>
+        <div id="moonInfo"></div>
+        <div id="ctxInfo"></div>
+      </div>
+      <div class="error" id="error"></div>
+    </div>
+  </div>
+  <script>
+    const apiBaseUrlRaw = "%s";
+    const apiBaseUrl = new URL(apiBaseUrlRaw, window.location.origin).toString();
+    const baseQuery = "%s"; // 不含 city/refresh
+    const initialCity = "%s";
+    const hasCityParam = initialCity !== "";
+    let currentCity = initialCity;
+    let refreshMs = %d * 1000;
+    let timer = null;
+    // 轨迹记录：限定时间窗与点数，避免无限增长
+    const sunTrack = [];
+    const moonTrack = [];
+    const trackLimit = 300;
+    const trackWindowMs = 30 * 60 * 1000;
+
+    const compassCanvas = document.getElementById("compass");
+    const compassCtx = compassCanvas.getContext("2d");
+    const altCanvas = document.getElementById("altitude");
+    const altCtx = altCanvas.getContext("2d");
+    const cityWrap = document.getElementById("cityWrap");
+    const citySelect = document.getElementById("citySelect");
+
+    const deg = Math.PI / 180;
+    const headingFromAz = (azDeg) => (azDeg + 180) %% 360; // 数据 0=南，转为 0=北 顺时针
+
+    function hexToRgb(hex) {
+      const res = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
+      if (!res) return { r: 255, g: 255, b: 255 };
+      return {
+        r: parseInt(res[1], 16),
+        g: parseInt(res[2], 16),
+        b: parseInt(res[3], 16),
+      };
+    }
+
+    function azToXY(azDeg, r) {
+      const rad = azDeg * deg;
+      return { x: r * Math.sin(rad), y: -r * Math.cos(rad) }; // 北在上
+    }
+
+    function drawBackdrop(ctx, cx, cy, r) {
+      const g = ctx.createRadialGradient(cx, cy, r * 0.1, cx, cy, r * 1.35);
+      g.addColorStop(0, "rgba(116,192,255,0.18)");
+      g.addColorStop(0.5, "rgba(78,138,210,0.12)");
+      g.addColorStop(1, "rgba(0,0,0,0)");
+      ctx.fillStyle = g;
+      ctx.fillRect(0, 0, compassCanvas.width, compassCanvas.height);
+    }
+
+    function drawCompass(cx, cy, r) {
+      drawBackdrop(compassCtx, cx, cy, r);
+      compassCtx.strokeStyle = "rgba(255,255,255,0.25)";
+      compassCtx.lineWidth = 2;
+      compassCtx.beginPath();
+      compassCtx.arc(cx, cy, r, 0, Math.PI * 2);
+      compassCtx.stroke();
+
+      [0.55, 0.75, 0.9].forEach((k, i) => {
+        compassCtx.setLineDash(i === 0 ? [4, 6] : i === 1 ? [3, 6] : []);
+        compassCtx.beginPath();
+        compassCtx.arc(cx, cy, r * k, 0, Math.PI * 2);
+        compassCtx.strokeStyle = i === 2 ? "rgba(255,255,255,0.26)" : "rgba(255,255,255,0.14)";
+        compassCtx.lineWidth = i === 2 ? 1.8 : 1.1;
+        compassCtx.stroke();
+      });
+      compassCtx.setLineDash([]);
+
+      const dirs = [
+        { text: "北", az: 0 },
+        { text: "东", az: 90 },
+        { text: "南", az: 180 },
+        { text: "西", az: 270 },
+      ];
+      compassCtx.font = "13px 'Segoe UI', Arial";
+      compassCtx.fillStyle = "rgba(255,255,255,0.9)";
+      dirs.forEach(d => {
+        const p = azToXY(d.az, r + 16);
+        compassCtx.fillText(d.text, cx + p.x - 6, cy + p.y + 5);
+        compassCtx.beginPath();
+        compassCtx.moveTo(cx, cy);
+        compassCtx.lineTo(cx + p.x * 0.92, cy + p.y * 0.92);
+        compassCtx.strokeStyle = "rgba(116,192,255,0.35)";
+        compassCtx.lineWidth = 1.2;
+        compassCtx.stroke();
+      });
+
+      compassCtx.fillStyle = "rgba(255,255,255,0.8)";
+      compassCtx.beginPath();
+      compassCtx.arc(cx, cy, 5, 0, Math.PI * 2);
+      compassCtx.fill();
+      compassCtx.fillText("地球", cx + 10, cy + 4);
+    }
+
+    function drawTrackCompass(track, r, color, cx, cy) {
+      if (track.length < 2) return;
+      const rgb = hexToRgb(color);
+      for (let i = 1; i < track.length; i++) {
+        const p0 = azToXY(track[i - 1].heading, r);
+        const p1 = azToXY(track[i].heading, r);
+        const alpha = 0.25 + 0.55 * (i / (track.length - 1));
+        compassCtx.strokeStyle = "rgba(" + rgb.r + "," + rgb.g + "," + rgb.b + "," + alpha.toFixed(3) + ")";
+        compassCtx.lineWidth = 1.8;
+        compassCtx.setLineDash([]);
+        compassCtx.beginPath();
+        compassCtx.moveTo(cx + p0.x, cy + p0.y);
+        compassCtx.lineTo(cx + p1.x, cy + p1.y);
+        compassCtx.stroke();
+      }
+    }
+
+    function drawBody(body, r, color, label, sizeFactor, cx, cy, baseR) {
+      const heading = headingFromAz(body.azimuth_deg);
+      const pos = azToXY(heading, r);
+      const x = cx + pos.x;
+      const y = cy + pos.y;
+
+      compassCtx.strokeStyle = "rgba(116,192,255,0.78)";
+      compassCtx.lineWidth = 1.5;
+      compassCtx.setLineDash([6, 6]);
+      compassCtx.beginPath();
+      compassCtx.moveTo(cx, cy);
+      compassCtx.lineTo(x, y);
+      compassCtx.stroke();
+      compassCtx.setLineDash([]);
+
+      const altLen = (body.altitude_deg / 90) * baseR * 0.25;
+      compassCtx.strokeStyle = color;
+      compassCtx.lineWidth = 1.8;
+      compassCtx.setLineDash([4, 5]);
+      compassCtx.beginPath();
+      compassCtx.moveTo(x, y);
+      compassCtx.lineTo(x, y - altLen);
+      compassCtx.stroke();
+      compassCtx.setLineDash([]);
+      compassCtx.fillStyle = color;
+      compassCtx.font = "13px 'Segoe UI', Arial";
+      compassCtx.fillText(body.altitude_deg.toFixed(1) + "°", x + 8, y - altLen - 6);
+
+      const outerBase = 19;
+      const innerBase = 11;
+      const glowBase = 26;
+      const outer = outerBase * sizeFactor;
+      const inner = innerBase * sizeFactor;
+      const glowR = glowBase * sizeFactor;
+
+      const glow = compassCtx.createRadialGradient(x, y, 0, x, y, glowR);
+      glow.addColorStop(0, color);
+      glow.addColorStop(1, "rgba(0,0,0,0)");
+      compassCtx.fillStyle = glow;
+      compassCtx.beginPath();
+      compassCtx.arc(x, y, outer, 0, Math.PI * 2);
+      compassCtx.fill();
+
+      compassCtx.shadowColor = color;
+      compassCtx.shadowBlur = 14 * sizeFactor;
+      compassCtx.fillStyle = color;
+      compassCtx.beginPath();
+      compassCtx.arc(x, y, inner, 0, Math.PI * 2);
+      compassCtx.fill();
+      compassCtx.shadowBlur = 0;
+
+      compassCtx.fillText(label + " / 方位 " + body.azimuth_deg.toFixed(1) + "°", x + outer + 6, y - 6);
+    }
+
+    function drawAltitudeView(data, baseR, sunTrackData, moonTrackData) {
+      const w = altCanvas.width;
+      const h = altCanvas.height;
+      const margin = 26;
+      const zeroY = h - margin;
+      const maxAlt = 90;
+
+      altCtx.fillStyle = "rgba(255,255,255,0.06)";
+      altCtx.fillRect(0, 0, w, h);
+
+      // 背景渐变
+      const g = altCtx.createLinearGradient(0, h, 0, 0);
+      g.addColorStop(0, "rgba(0,0,0,0)");
+      g.addColorStop(1, "rgba(80,140,210,0.08)");
+      altCtx.fillStyle = g;
+      altCtx.fillRect(0, 0, w, h);
+
+      altCtx.strokeStyle = "rgba(255,255,255,0.22)";
+      altCtx.lineWidth = 1.2;
+      altCtx.beginPath();
+      altCtx.moveTo(margin, zeroY);
+      altCtx.lineTo(w - margin, zeroY);
+      altCtx.stroke();
+
+      // 网格线
+      [15, 30, 45, 60, 75, 90].forEach((alt, idx) => {
+        const y = zeroY - (alt / maxAlt) * (h - margin * 2);
+        altCtx.setLineDash(idx %% 2 === 0 ? [4, 6] : []);
+        altCtx.strokeStyle = idx === 5 ? "rgba(255,255,255,0.25)" : "rgba(255,255,255,0.15)";
+        altCtx.beginPath();
+        altCtx.moveTo(margin, y);
+        altCtx.lineTo(w - margin, y);
+        altCtx.stroke();
+        altCtx.setLineDash([]);
+        altCtx.fillStyle = "rgba(255,255,255,0.85)";
+        altCtx.font = "12px 'Segoe UI', Arial";
+        altCtx.fillText(alt + "°", 6, y + 4);
+      });
+
+      const slots = [
+        { obj: data.sun, color: "#ffd166", label: "太阳", x: w * 0.32 },
+        { obj: data.moon, color: "#9ad1ff", label: "月亮", x: w * 0.68 },
+      ];
+
+      function drawAltTrack(track, color) {
+        if (track.length < 2) return;
+        const rgb = hexToRgb(color);
+        altCtx.setLineDash([]);
+        altCtx.lineWidth = 2;
+        altCtx.beginPath();
+        const baseTs = track[0].ts;
+        const lastTs = track[track.length - 1].ts || baseTs;
+        const span = Math.max(1, lastTs-baseTs);
+        track.forEach((pt, idx) => {
+          const alt = Math.max(-10, Math.min(90, pt.alt));
+          const y = zeroY - (alt / maxAlt) * (h - margin * 2);
+          const x = margin + ((pt.ts - baseTs) / span) * (w - margin * 2);
+          if (idx === 0) altCtx.moveTo(x, y);
+          else altCtx.lineTo(x, y);
+          const alpha = 0.25 + 0.6 * (idx / (track.length - 1 || 1));
+          altCtx.strokeStyle = "rgba(" + rgb.r + "," + rgb.g + "," + rgb.b + "," + alpha.toFixed(3) + ")";
+        });
+        altCtx.stroke();
+      }
+
+      drawAltTrack(sunTrackData, "#ffd166");
+      drawAltTrack(moonTrackData, "#9ad1ff");
+
+      slots.forEach(slot => {
+        const alt = Math.max(-10, Math.min(90, slot.obj.altitude_deg));
+        const y = zeroY - (alt / maxAlt) * (h - margin * 2);
+
+        altCtx.strokeStyle = slot.color;
+        altCtx.lineWidth = 2;
+        altCtx.setLineDash([4, 5]);
+        altCtx.beginPath();
+        altCtx.moveTo(slot.x, zeroY);
+        altCtx.lineTo(slot.x, y);
+        altCtx.stroke();
+        altCtx.setLineDash([]);
+
+        const outer = 14;
+        const inner = 8;
+        const glow = altCtx.createRadialGradient(slot.x, y, 0, slot.x, y, 24);
+        glow.addColorStop(0, slot.color);
+        glow.addColorStop(1, "rgba(0,0,0,0)");
+        altCtx.fillStyle = glow;
+        altCtx.beginPath();
+        altCtx.arc(slot.x, y, outer, 0, Math.PI * 2);
+        altCtx.fill();
+
+        altCtx.shadowColor = slot.color;
+        altCtx.shadowBlur = 12;
+        altCtx.fillStyle = slot.color;
+        altCtx.beginPath();
+        altCtx.arc(slot.x, y, inner, 0, Math.PI * 2);
+        altCtx.fill();
+        altCtx.shadowBlur = 0;
+
+        altCtx.fillStyle = slot.color;
+        altCtx.font = "13px 'Segoe UI', Arial";
+        const text = slot.label + " 高度 " + slot.obj.altitude_deg.toFixed(1) + "° / 方位 " + slot.obj.azimuth_deg.toFixed(1) + "°";
+        altCtx.fillText(text, slot.x + 14, y + 4);
+      });
+    }
+
+    function drawScene(data) {
+      compassCtx.clearRect(0, 0, compassCanvas.width, compassCanvas.height);
+      altCtx.clearRect(0, 0, altCanvas.width, altCanvas.height);
+
+      const cx = compassCanvas.width / 2;
+      const cy = compassCanvas.height / 2;
+      const baseR = Math.min(compassCanvas.width, compassCanvas.height) * 0.42;
+      const sunR = baseR * 0.72;
+      const moonR = baseR * 0.38;
+
+      drawCompass(cx, cy, baseR);
+      drawTrackCompass(sunTrack, sunR, "#ffd166", cx, cy);
+      drawTrackCompass(moonTrack, moonR, "#9ad1ff", cx, cy);
+      drawBody(data.sun, sunR, "#ffd166", "太阳", 1, cx, cy, baseR);
+      drawBody(data.moon, moonR, "#9ad1ff", "月亮", 0.7, cx, cy, baseR);
+      drawAltitudeView(data, baseR, sunTrack, moonTrack);
+
+      document.getElementById("apiPreview").textContent = buildApiUrl();
+    }
+
+    function setInfo(data) {
+      const sun = data.sun;
+      const moon = data.moon;
+      document.getElementById("sunInfo").innerHTML = "<strong>太阳</strong><br>方位角: " + sun.azimuth_deg.toFixed(2) + "° (" + sun.azimuth_text + ")<br>高度角: " + sun.altitude_deg.toFixed(2) + "°<br>地日距离: " + sun.distance_km.toFixed(0) + " km";
+      document.getElementById("moonInfo").innerHTML = "<strong>月亮</strong><br>方位角: " + moon.azimuth_deg.toFixed(2) + "° (" + moon.azimuth_text + ")<br>高度角: " + moon.altitude_deg.toFixed(2) + "°<br>地月距离: " + moon.distance_km.toFixed(0) + " km";
+      document.getElementById("ctxInfo").innerHTML = "<strong>定位</strong><br>城市: " + data.display + "<br>坐标: " + data.lat.toFixed(4) + ", " + data.lon.toFixed(4) + "<br>时区: " + data.timezone + "<br>当地时间: " + data.local_time;
+    }
+
+    function buildApiUrl() {
+      const params = new URLSearchParams(baseQuery);
+      if (currentCity) params.set("city", currentCity);
+      return apiBaseUrl + (params.toString() ? "?" + params.toString() : "");
+    }
+
+    async function fetchAndDraw() {
+      const status = document.getElementById("status");
+      const errBox = document.getElementById("error");
+      status.textContent = "更新中...";
+      errBox.textContent = "";
+      if (!currentCity) {
+        status.textContent = "请选择城市后再刷新";
+        return;
+      }
+      try {
+        const res = await fetch(buildApiUrl(), { cache: "no-store" });
+        if (!res.ok) {
+          throw new Error("HTTP " + res.status + " - " + (await res.text()));
+        }
+        const data = await res.json();
+
+        const nowTs = Date.now();
+        const sunHeading = headingFromAz(data.sun.azimuth_deg);
+        const moonHeading = headingFromAz(data.moon.azimuth_deg);
+        sunTrack.push({ heading: sunHeading, alt: data.sun.altitude_deg, ts: nowTs });
+        moonTrack.push({ heading: moonHeading, alt: data.moon.altitude_deg, ts: nowTs });
+        const cutoff = nowTs - trackWindowMs;
+        while (sunTrack.length > trackLimit || (sunTrack[0] && sunTrack[0].ts < cutoff)) sunTrack.shift();
+        while (moonTrack.length > trackLimit || (moonTrack[0] && moonTrack[0].ts < cutoff)) moonTrack.shift();
+
+        drawScene(data);
+        setInfo(data);
+        status.textContent = "已更新：" + new Date().toLocaleTimeString();
+      } catch (err) {
+        errBox.textContent = "拉取失败: " + err.message;
+        status.textContent = "等待重试";
+      }
+    }
+
+    function startTimer() {
+      if (!currentCity) return;
+      if (timer) clearInterval(timer);
+      timer = setInterval(fetchAndDraw, refreshMs);
+    }
+
+    async function loadCities() {
+      try {
+        const res = await fetch("/api/cities", { cache: "no-store" });
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        const list = await res.json();
+        if (!Array.isArray(list) || list.length === 0) {
+          citySelect.innerHTML = "<option value=\"\">无本地缓存城市</option>";
+          return;
+        }
+        citySelect.innerHTML = "";
+        list.forEach(item => {
+          const opt = document.createElement("option");
+          opt.value = item.city;
+          opt.textContent = item.display_name || item.city;
+          citySelect.appendChild(opt);
+          allCities.push({ city: item.city, display: item.display_name || item.city });
+        });
+        if (!currentCity) {
+          currentCity = list[0].city;
+          citySelect.value = currentCity;
+        } else {
+          citySelect.value = currentCity;
+        }
+        fetchAndDraw();
+        startTimer();
+      } catch (err) {
+        citySelect.innerHTML = "<option value=\"\">加载失败</option>";
+        document.getElementById("error").textContent = "城市列表获取失败: " + err.message;
+      }
+    }
+
+    citySelect.addEventListener("change", (e) => {
+      currentCity = e.target.value;
+      fetchAndDraw();
+    });
+
+    document.getElementById("refreshInput").addEventListener("change", (e) => {
+      const v = Number(e.target.value);
+      if (!Number.isFinite(v) || v < 5) {
+        e.target.value = Math.max(5, v || 30);
+        return;
+      }
+      refreshMs = v * 1000;
+      startTimer();
+    });
+
+    document.getElementById("clearTrack").addEventListener("click", () => {
+      sunTrack.length = 0;
+      moonTrack.length = 0;
+      fetchAndDraw();
+    });
+
+    document.getElementById("copyApi").addEventListener("click", async () => {
+      try {
+        await navigator.clipboard.writeText(buildApiUrl());
+        document.getElementById("status").textContent = "已复制 API 链接";
+      } catch (err) {
+        document.getElementById("status").textContent = "复制失败";
+      }
+    });
+
+    const allCities = [];
+    const cityFilter = document.getElementById("cityFilter");
+
+    cityFilter?.addEventListener("input", () => {
+      const kw = cityFilter.value.toLowerCase();
+      citySelect.innerHTML = "";
+      const list = allCities.filter(c => c.display.toLowerCase().includes(kw) || c.city.toLowerCase().includes(kw));
+      if (list.length === 0) {
+        citySelect.innerHTML = "<option value=\"\">无匹配</option>";
+        return;
+      }
+      list.forEach(item => {
+        const opt = document.createElement("option");
+        opt.value = item.city;
+        opt.textContent = item.display;
+        citySelect.appendChild(opt);
+      });
+      if (list.find(c => c.city === currentCity)) {
+        citySelect.value = currentCity;
+      } else {
+        currentCity = list[0].city;
+        citySelect.value = currentCity;
+        fetchAndDraw();
+      }
+    });
+
+    document.getElementById("refreshNow").addEventListener("click", fetchAndDraw);
+
+    if (!hasCityParam) {
+      cityWrap.style.display = "flex";
+      loadCities();
+    } else {
+      fetchAndDraw();
+      startTimer();
+    }
+  </script>
+</body>
+</html>`, html.EscapeString(title), refreshSec, html.EscapeString(apiBasePath), html.EscapeString(baseQuery), html.EscapeString(initialCity), refreshSec)
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = w.Write([]byte(htmlStr))
+}
+
+// astroAPIHandler 处理 /api/astro 请求，支持城市或坐标查询。
+func astroAPIHandler(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	mode := strings.ToLower(q.Get("mode"))
+	if mode == "" {
+		mode = "year"
+	}
+
+	ctx, status, err := resolveContextFromQuery(q)
+	if err != nil {
+		http.Error(w, err.Error(), status)
+		return
 	}
 
 	var (
@@ -1796,6 +2460,9 @@ var serveCmd = &cobra.Command{
 		}
 		mux := http.NewServeMux()
 		mux.HandleFunc("/api/astro", astroAPIHandler)
+		mux.HandleFunc("/api/positions", positionsAPIHandler)
+		mux.HandleFunc("/api/cities", citiesAPIHandler)
+		mux.HandleFunc("/view/positions", positionsPageHandler)
 		mux.HandleFunc("/healthz", healthHandler)
 		mux.HandleFunc("/readyz", readyHandler)
 
@@ -1804,6 +2471,9 @@ var serveCmd = &cobra.Command{
 		logInfof("GET /readyz")
 		logInfof("GET /api/astro?city=Beijing&mode=day&date=2025-01-01")
 		logInfof("GET /api/astro?lat=39.9&lon=116.4&tz=Asia/Shanghai&mode=year")
+		logInfof("GET /api/positions?city=Beijing")
+		logInfof("GET /api/cities")
+		logInfof("GET /view/positions?city=Beijing&refresh=30")
 
 		stop := make(chan os.Signal, 1)
 		signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)

@@ -110,6 +110,8 @@ func TestDescribeAzimuth(t *testing.T) {
 		{-180, "正北"},
 		{90, "正西"},
 		{-8, "正南略微偏东"},
+		{179.9, "正北"},
+		{-90, "正东"},
 	}
 	for _, c := range cases {
 		if got := describeAzimuth(c.azDeg); got != c.want {
@@ -835,6 +837,38 @@ func TestAstroAPIHandlerBadRequest(t *testing.T) {
 	}
 }
 
+func TestBuildLivePositionsWithFixedTime(t *testing.T) {
+	origNow := app.now
+	defer func() { app.now = origNow }()
+
+	loc := time.FixedZone("UTC", 0)
+	fixed := time.Date(2025, 1, 1, 6, 0, 0, 0, loc)
+	app.now = func() time.Time { return fixed }
+
+	ctx := &CityContext{
+		City:        "TestCity",
+		DisplayName: "TestCity",
+		Lat:         0,
+		Lon:         0,
+		TZID:        "UTC",
+		Loc:         loc,
+	}
+
+	resp := buildLivePositions(ctx)
+	if resp.City != "TestCity" || resp.Timezone != "UTC" {
+		t.Fatalf("unexpected response meta: %+v", resp)
+	}
+	if resp.LocalTime == "" {
+		t.Fatal("LocalTime should not be empty")
+	}
+	if resp.Sun.AzimuthText == "" || resp.Moon.AzimuthText == "" {
+		t.Errorf("expected azimuth text present, got sun=%q moon=%q", resp.Sun.AzimuthText, resp.Moon.AzimuthText)
+	}
+	if resp.Sun.AzimuthDeg < -360 || resp.Sun.AzimuthDeg > 360 {
+		t.Errorf("sun azimuth out of range: %f", resp.Sun.AzimuthDeg)
+	}
+}
+
 func TestHealthHandler(t *testing.T) {
 	req := httptest.NewRequest("GET", "/healthz", nil)
 	w := httptest.NewRecorder()
@@ -1102,6 +1136,30 @@ func TestAstroAPIHandlerErrors(t *testing.T) {
 
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Errorf("Expected status 400 for invalid timezone, got %d", resp.StatusCode)
+	}
+}
+
+func TestPositionsAPIHandlerCoords(t *testing.T) {
+	req := httptest.NewRequest("GET", "/api/positions?lat=0&lon=0&tz=UTC", nil)
+	w := httptest.NewRecorder()
+
+	positionsAPIHandler(w, req)
+	resp := w.Result()
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+
+	var parsed livePositionsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
+		t.Fatalf("decode error: %v", err)
+	}
+	if parsed.Timezone != "UTC" {
+		t.Errorf("Timezone = %q, want UTC", parsed.Timezone)
+	}
+	if parsed.Sun.AzimuthText == "" || parsed.Moon.AzimuthText == "" {
+		t.Errorf("expected non-empty azimuth text, sun=%q moon=%q", parsed.Sun.AzimuthText, parsed.Moon.AzimuthText)
 	}
 }
 

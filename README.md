@@ -7,6 +7,16 @@
 
 ⸻
 
+🚀 快速开始
+
+- 启动服务：`esunmoon serve --addr :8080`
+- 打开 2D 双视图：浏览器访问 `http://localhost:8080/view/positions?city=Beijing&refresh=30`
+- 城市选择：页面支持缓存城市列表+搜索过滤（输入关键字筛选）
+- 轨迹：方位盘/高度条自打开起记录太阳/月亮轨迹，点击“清空轨迹”即可重置
+- API 复制：页面展示当前 `/api/positions` 链接，可一键复制便于调试或集成
+
+⸻
+
 ✨ 项目简介
 
 eSunMoon 是一个使用 Go 开发的天文数据生成工具，基于给定城市或经纬度，自动计算当地时区下的太阳、月亮观测数据，并支持：
@@ -126,6 +136,11 @@ esunmoon serve --addr :8080
 健康/就绪：
 	•	GET /healthz
 	•	GET /readyz
+实时 2D 双视图（方位盘 + 高度条，带轨迹与城市搜索）：
+	•	GET /api/positions?city=Beijing
+	•	GET /api/cities                              # 缓存城市列表（支持搜索过滤）
+	•	GET /view/positions?city=Beijing&refresh=30   # HTML 页面，默认 30 秒刷新，可调整；从打开时刻开始绘制太阳/月亮轨迹，可清空
+	•	GET /view/positions                           # 不带 city 时，页面列出缓存城市供选择
 
 
 ⸻
@@ -167,6 +182,20 @@ JSON 输出兼容前端可视化绘图需要：
 
 
 ⸻
+
+/api/positions （轻量实时坐标）
+
+返回当前时刻太阳/月亮方位、高度、距离，适合实时看板：
+
+GET /api/positions?city=Beijing
+GET /api/positions?lat=39.9&lon=116.4&tz=Asia/Shanghai
+
+配套的 2D 双视图网页：
+	• 方位盘：北在上，可视化方位角，附带过去 30 分钟轨迹线（可清空）
+	• 高度条：侧视高度曲线，显示对应时间的高度变化
+	• 城市列表支持搜索；页面展示 API 链接并可一键复制
+使用方式：GET /view/positions?city=Beijing&refresh=30
+
 
 ✅ Chart 支持
 
