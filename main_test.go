@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,6 +19,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/spf13/pflag"
 )
 
 //
@@ -37,6 +40,121 @@ func TestNormalizeCityKey(t *testing.T) {
 		if got := normalizeCityKey(c.in); got != c.want {
 			t.Errorf("normalizeCityKey(%q) = %q, want %q", c.in, got, c.want)
 		}
+	}
+}
+
+func TestParseLogLevel(t *testing.T) {
+	cases := []struct {
+		in   string
+		want LogLevel
+	}{
+		{"debug", LevelDebug},
+		{"WARN", LevelWarn},
+		{"error", LevelError},
+		{"", LevelInfo},
+		{"unknown", LevelInfo},
+	}
+	for _, c := range cases {
+		if got := parseLogLevel(c.in); got != c.want {
+			t.Errorf("parseLogLevel(%q) = %v, want %v", c.in, got, c.want)
+		}
+	}
+}
+
+func TestLoggerFilteringAndJSON(t *testing.T) {
+	var buf bytes.Buffer
+	fixedNow := func() time.Time { return time.Date(2025, 1, 1, 12, 0, 0, 0, time.UTC) }
+	logger := NewLogger(&buf, LevelWarn, true, false, fixedNow)
+
+	// info should be filtered out
+	logger.logf(LevelInfo, "info", "hello %s", "world")
+	// warn should appear
+	logger.logf(LevelWarn, "warn", "warn %d", 1)
+
+	if strings.Contains(buf.String(), "hello") {
+		t.Fatalf("info log should be filtered out, got buffer: %s", buf.String())
+	}
+	if !strings.Contains(buf.String(), "\"level\":\"warn\"") || !strings.Contains(buf.String(), "\"msg\":\"warn 1\"") {
+		t.Fatalf("warn log not found or not JSON formatted: %s", buf.String())
+	}
+	if !strings.Contains(buf.String(), "\"ts\":\"2025-01-01T12:00:00Z\"") {
+		t.Fatalf("expected fixed timestamp in output, got: %s", buf.String())
+	}
+}
+
+func TestLoggerTextOutputAndQuiet(t *testing.T) {
+	var buf bytes.Buffer
+	fixedNow := func() time.Time { return time.Date(2025, 1, 1, 12, 0, 0, 0, time.UTC) }
+	logger := NewLogger(&buf, LevelInfo, false, false, fixedNow)
+	logger.logf(LevelInfo, "info", "plain %d", 7)
+	if !strings.Contains(buf.String(), "[2025-01-01T12:00:00Z] INFO  plain 7") {
+		t.Fatalf("text logger output mismatch: %q", buf.String())
+	}
+	buf.Reset()
+	quiet := NewLogger(&buf, LevelInfo, false, true, fixedNow)
+	quiet.logf(LevelInfo, "info", "should be muted")
+	if buf.Len() != 0 {
+		t.Fatalf("quiet logger should not output, got: %q", buf.String())
+	}
+}
+
+func TestLoggerLevelFiltering(t *testing.T) {
+	var buf bytes.Buffer
+	fixedNow := func() time.Time { return time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC) }
+	logger := NewLogger(&buf, LevelWarn, false, false, fixedNow)
+	logger.logf(LevelDebug, "debug", "hidden")
+	logger.logf(LevelInfo, "info", "hidden")
+	logger.logf(LevelWarn, "warn", "shown")
+	if strings.Contains(buf.String(), "hidden") {
+		t.Fatalf("lower level logs should be filtered, got %q", buf.String())
+	}
+	if !strings.Contains(buf.String(), "WARN") || !strings.Contains(buf.String(), "shown") {
+		t.Fatalf("warn log missing: %q", buf.String())
+	}
+}
+
+func TestCacheSaveAndLoad(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+
+	cache := &CityCache{
+		Entries: map[string]CityCacheEntry{
+			"beijing": {
+				City:        "beijing",
+				Normalized:  "beijing",
+				DisplayName: "Beijing",
+				Lat:         39.9,
+				Lon:         116.4,
+				TimezoneID:  "Asia/Shanghai",
+				UpdatedAt:   "2025-01-01",
+			},
+		},
+	}
+	if err := saveCache(cache); err != nil {
+		t.Fatalf("saveCache error: %v", err)
+	}
+	loaded := loadCache()
+	got, ok := loaded.Entries["beijing"]
+	if !ok {
+		t.Fatalf("expected entry beijing after load")
+	}
+	if got.DisplayName != "Beijing" || got.Lat != 39.9 || got.TimezoneID != "Asia/Shanghai" {
+		t.Errorf("loaded entry mismatch: %+v", got)
+	}
+}
+
+func TestAcquireFileLockCancel(t *testing.T) {
+	tmp := t.TempDir()
+	lockPath := filepath.Join(tmp, "test.lock")
+	// Pre-create to force contention.
+	if err := os.WriteFile(lockPath, []byte("hold"), 0o600); err != nil {
+		t.Fatalf("prep lock file err: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	_, err := acquireFileLock(ctx, lockPath)
+	if err == nil {
+		t.Fatalf("expected acquireFileLock to respect context timeout")
 	}
 }
 
@@ -65,6 +183,114 @@ func TestRunYearWithOutDir(t *testing.T) {
 	}
 }
 
+func TestRunYearNoOverwriteFails(t *testing.T) {
+	loc, _ := time.LoadLocation("UTC")
+	ctx := &CityContext{
+		City:        "TestCity",
+		DisplayName: "Test City",
+		Lat:         0,
+		Lon:         0,
+		TZID:        "UTC",
+		Loc:         loc,
+		Now:         time.Date(2025, 1, 2, 15, 4, 5, 0, loc),
+	}
+	tmpDir := t.TempDir()
+	t.Setenv("HOME", tmpDir)
+	outDir := filepath.Join(tmpDir, "out")
+	_ = os.MkdirAll(outDir, 0o755)
+	opts := OutputOptions{Format: "json", AllowOverwrite: false, OutDir: outDir}
+	// first write succeeds
+	if err := runYear(ctx, opts); err != nil {
+		t.Fatalf("initial runYear error: %v", err)
+	}
+	// second should fail because overwrite not allowed
+	if err := runYear(ctx, opts); err == nil {
+		t.Fatalf("expected overwrite protection error on second run")
+	}
+}
+
+func TestRunYearInvalidFormat(t *testing.T) {
+	loc, _ := time.LoadLocation("UTC")
+	ctx := &CityContext{
+		City:        "TestCity",
+		DisplayName: "Test City",
+		Lat:         0,
+		Lon:         0,
+		TZID:        "UTC",
+		Loc:         loc,
+		Now:         time.Date(2025, 1, 2, 15, 4, 5, 0, loc),
+	}
+	tmpDir := t.TempDir()
+	opts := OutputOptions{Format: "invalid", AllowOverwrite: true, OutDir: tmpDir}
+	if err := runYear(ctx, opts); err != nil {
+		t.Fatalf("unexpected error for invalid format fallback: %v", err)
+	}
+	expected := filepath.Join(tmpDir, "TestCity-2025-01-02-year.txt")
+	if _, err := os.Stat(expected); err != nil {
+		t.Fatalf("fallback txt file missing: %v", err)
+	}
+}
+
+func TestRunDayWriteFailure(t *testing.T) {
+	loc, _ := time.LoadLocation("UTC")
+	ctx := &CityContext{
+		City:        "TestCity",
+		DisplayName: "Test City",
+		Lat:         0,
+		Lon:         0,
+		TZID:        "UTC",
+		Loc:         loc,
+		Now:         time.Date(2025, 1, 2, 15, 4, 5, 0, loc),
+	}
+	// use unwritable dir
+	opts := OutputOptions{Format: "txt", AllowOverwrite: true, OutDir: "/root/should-fail"}
+	if err := runDay(ctx, "2025-01-01", opts); err == nil {
+		t.Fatalf("expected write failure for unwritable outdir")
+	}
+}
+
+func TestRunYearWriteFailure(t *testing.T) {
+	loc, _ := time.LoadLocation("UTC")
+	ctx := &CityContext{
+		City:        "TestCity",
+		DisplayName: "Test City",
+		Lat:         0,
+		Lon:         0,
+		TZID:        "UTC",
+		Loc:         loc,
+		Now:         time.Date(2025, 1, 2, 15, 4, 5, 0, loc),
+	}
+	opts := OutputOptions{Format: "txt", AllowOverwrite: false, OutDir: "/root/should-fail"}
+	if err := runYear(ctx, opts); err == nil {
+		t.Fatalf("expected write failure for unwritable outdir")
+	}
+}
+
+func TestRunLivePositionsZeroInterval(t *testing.T) {
+	loc := time.FixedZone("UTC", 0)
+	ctx := &CityContext{
+		City:        "TestCity",
+		DisplayName: "Test City",
+		Lat:         0,
+		Lon:         0,
+		TZID:        "UTC",
+		Loc:         loc,
+		Now:         time.Date(2025, 1, 2, 0, 0, 0, 0, loc),
+	}
+	origNow := app.now
+	app.now = func() time.Time { return time.Date(2025, 1, 2, 0, 0, 0, 0, loc) }
+	defer func() { app.now = origNow }()
+
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		p, _ := os.FindProcess(os.Getpid())
+		_ = p.Signal(syscall.SIGINT)
+	}()
+	if err := runLivePositions(ctx, 0); err != nil {
+		t.Fatalf("runLivePositions should handle zero interval, got err: %v", err)
+	}
+}
+
 func TestFormatDuration(t *testing.T) {
 	if got := formatDuration(0); got != "--" {
 		t.Errorf("formatDuration(0) = %q, want %q", got, "--")
@@ -72,6 +298,15 @@ func TestFormatDuration(t *testing.T) {
 	d := 2*time.Hour + 30*time.Minute
 	if got := formatDuration(d); got != "02:30" {
 		t.Errorf("formatDuration(2h30m) = %q, want %q", got, "02:30")
+	}
+	if got := formatDuration(-time.Minute); got != "--" {
+		t.Errorf("formatDuration(negative) = %q, want --", got)
+	}
+	if got := formatDuration(90 * time.Second); got != "00:01" {
+		t.Errorf("formatDuration(90s) = %q, want 00:01", got)
+	}
+	if got := formatDuration(25 * time.Hour); got != "25:00" {
+		t.Errorf("formatDuration(25h) = %q, want 25:00", got)
 	}
 }
 
@@ -83,6 +318,176 @@ func TestFormatTimeLocal(t *testing.T) {
 	tm := time.Date(2025, 1, 2, 3, 4, 5, 0, loc)
 	if got := formatTimeLocal(tm); got != "03:04" {
 		t.Errorf("formatTimeLocal(2025-01-02 03:04) = %q, want %q", got, "03:04")
+	}
+}
+
+func TestFormatTimeLocalEdge(t *testing.T) {
+	loc := time.FixedZone("EDGE", 8*3600)
+	tm := time.Date(2025, 12, 31, 23, 59, 59, 0, loc)
+	if got := formatTimeLocal(tm); got != "23:59" {
+		t.Errorf("formatTimeLocal edge = %q, want 23:59", got)
+	}
+}
+
+func TestFormatTimeLocalDifferentZones(t *testing.T) {
+	utc := time.FixedZone("UTC", 0)
+	est := time.FixedZone("EST", -5*3600)
+	t1 := time.Date(2025, 1, 2, 9, 30, 0, 0, utc)
+	t2 := t1.In(est)
+	if got := formatTimeLocal(t1); got != "09:30" {
+		t.Errorf("formatTimeLocal UTC = %q, want 09:30", got)
+	}
+	if got := formatTimeLocal(t2); got != "04:30" {
+		t.Errorf("formatTimeLocal EST = %q, want 04:30", got)
+	}
+}
+
+func TestServeWithGracefulShutdownAddrInUse(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Skipf("unable to listen to build addr-in-use scenario: %v", err)
+	}
+	defer l.Close()
+	addr := l.Addr().String()
+
+	stop := make(chan os.Signal, 1)
+	err = serveWithGracefulShutdown(addr, http.NewServeMux(), stop)
+	if err == nil {
+		t.Fatalf("expected bind error for addr already in use")
+	}
+	if !strings.Contains(err.Error(), "address already in use") && !strings.Contains(err.Error(), "bind") {
+		t.Fatalf("unexpected error for addr in use: %v", err)
+	}
+}
+
+func TestServeWithGracefulShutdownTimeout(t *testing.T) {
+	orig := serveShutdown
+	serveShutdown = 20 * time.Millisecond
+	defer func() { serveShutdown = orig }()
+
+	// Pick an address likely free: take from a temp listener then close.
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Skipf("cannot grab ephemeral port: %v", err)
+	}
+	addr := l.Addr().String()
+	l.Close()
+
+	block := make(chan struct{})
+	ready := make(chan struct{})
+	mux := http.NewServeMux()
+	mux.HandleFunc("/block", func(w http.ResponseWriter, r *http.Request) {
+		close(ready)
+		<-block // never released
+	})
+
+	stop := make(chan os.Signal, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- serveWithGracefulShutdown(addr, mux, stop)
+	}()
+
+	// Wait for server to start, then hit /block to create a hanging request.
+	time.Sleep(50 * time.Millisecond)
+	client := &http.Client{Timeout: 200 * time.Millisecond}
+	go func() { _, _ = client.Get("http://" + addr + "/block") }()
+
+	select {
+	case <-ready:
+	case <-time.After(200 * time.Millisecond):
+		t.Skip("server not ready to accept request (possible sandbox bind restrictions)")
+	}
+
+	stop <- syscall.SIGINT
+	err = <-errCh
+	if err == nil {
+		t.Fatalf("expected shutdown timeout error, got nil")
+	}
+	if !strings.Contains(err.Error(), "deadline exceeded") && !strings.Contains(err.Error(), "context deadline") {
+		t.Fatalf("expected deadline exceeded error, got: %v", err)
+	}
+}
+
+func TestServeWithGracefulShutdownCanceled(t *testing.T) {
+	orig := serveShutdown
+	serveShutdown = 200 * time.Millisecond
+	defer func() { serveShutdown = orig }()
+
+	stop := make(chan os.Signal, 1)
+	mux := http.NewServeMux()
+	errCh := make(chan error, 1)
+
+	go func() {
+		errCh <- serveWithGracefulShutdown("127.0.0.1:0", mux, stop)
+	}()
+
+	// 立即取消
+	stop <- syscall.SIGTERM
+
+	select {
+	case err := <-errCh:
+		if err != nil && err != http.ErrServerClosed {
+			t.Fatalf("expected nil or ErrServerClosed on early cancel, got %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("serveWithGracefulShutdown cancel path timed out")
+	}
+}
+
+func TestServeWithGracefulShutdownDoubleSignal(t *testing.T) {
+	orig := serveShutdown
+	serveShutdown = 500 * time.Millisecond
+	defer func() { serveShutdown = orig }()
+
+	stop := make(chan os.Signal, 2)
+	mux := http.NewServeMux()
+	errCh := make(chan error, 1)
+
+	go func() {
+		errCh <- serveWithGracefulShutdown("127.0.0.1:0", mux, stop)
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	stop <- syscall.SIGINT
+	stop <- syscall.SIGTERM
+
+	select {
+	case err := <-errCh:
+		if err != nil && err != http.ErrServerClosed && !strings.Contains(err.Error(), "operation not permitted") {
+			t.Fatalf("unexpected error on double signal: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("serveWithGracefulShutdown double-signal path timed out")
+	}
+}
+
+func TestServeWithGracefulShutdownListenError(t *testing.T) {
+	// Use an obviously invalid address
+	stop := make(chan os.Signal, 1)
+	err := serveWithGracefulShutdown("::::", http.NewServeMux(), stop)
+	if err == nil {
+		t.Fatalf("expected error for invalid listen addr")
+	}
+	if !strings.Contains(err.Error(), "address") && !strings.Contains(err.Error(), "listen") {
+		t.Fatalf("unexpected listen error: %v", err)
+	}
+}
+
+func TestHealthAndReadyHandlers(t *testing.T) {
+	req := httptest.NewRequest("GET", "/healthz", nil)
+	w := httptest.NewRecorder()
+	healthHandler(w, req)
+	if w.Result().StatusCode != http.StatusOK {
+		t.Fatalf("healthHandler status = %d, want 200", w.Result().StatusCode)
+	}
+
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	req = httptest.NewRequest("GET", "/readyz", nil)
+	w = httptest.NewRecorder()
+	readyHandler(w, req)
+	if w.Result().StatusCode != http.StatusOK {
+		t.Fatalf("readyHandler status = %d, want 200", w.Result().StatusCode)
 	}
 }
 
@@ -124,6 +529,416 @@ func TestDescribeAzimuth(t *testing.T) {
 		if got := describeAzimuth(c.azDeg); got != c.want {
 			t.Errorf("describeAzimuth(%v) = %q, want %q", c.azDeg, got, c.want)
 		}
+	}
+}
+
+func TestResolveContextFromQueryCoordsAndErrors(t *testing.T) {
+	origNow := app.now
+	app.now = func() time.Time { return time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC) }
+	defer func() { app.now = origNow }()
+
+	// success path with coords
+	q := url.Values{
+		"lat": []string{"10"},
+		"lon": []string{"20"},
+		"tz":  []string{"UTC"},
+	}
+	ctx, status, err := resolveContextFromQuery(q)
+	if err != nil || status != http.StatusOK {
+		t.Fatalf("resolveContextFromQuery success expected, got status=%d err=%v", status, err)
+	}
+	if ctx.Lat != 10 || ctx.Lon != 20 || ctx.TZID != "UTC" || ctx.City == "" || ctx.Now.IsZero() {
+		t.Fatalf("ctx fields mismatch: %+v", ctx)
+	}
+
+	// lat parse error
+	q = url.Values{"lat": []string{"bad"}, "lon": []string{"0"}, "tz": []string{"UTC"}}
+	if _, status, err := resolveContextFromQuery(q); err == nil || status != http.StatusBadRequest {
+		t.Fatalf("expected bad request for invalid lat, got status=%d err=%v", status, err)
+	}
+
+	// out of range
+	q = url.Values{"lat": []string{"200"}, "lon": []string{"0"}, "tz": []string{"UTC"}}
+	if _, status, err := resolveContextFromQuery(q); err == nil || status != http.StatusBadRequest {
+		t.Fatalf("expected bad request for out-of-range lat, got status=%d err=%v", status, err)
+	}
+
+	// missing tz triggers must provide error (no city either)
+	q = url.Values{"lat": []string{"0"}, "lon": []string{"0"}}
+	if _, status, err := resolveContextFromQuery(q); err == nil || status != http.StatusBadRequest {
+		t.Fatalf("expected error when missing tz and city, got status=%d err=%v", status, err)
+	}
+}
+
+func TestRootCmdFlagsAndPreRun(t *testing.T) {
+	flags := rootCmd.PersistentFlags()
+	for _, name := range []string{"log-level", "log-json", "log-quiet", "format", "offline", "overwrite", "outdir", "live", "live-interval"} {
+		if flags.Lookup(name) == nil {
+			t.Fatalf("missing persistent flag %q", name)
+		}
+	}
+
+	origConfig := *config
+	origLogger := app.logger
+	origLevel := logLevelFlag
+	origJSON := logJSONFlag
+	origQuiet := logQuietFlag
+	defer func() {
+		*config = origConfig
+		app.logger = origLogger
+		logLevelFlag = origLevel
+		logJSONFlag = origJSON
+		logQuietFlag = origQuiet
+	}()
+
+	logLevelFlag = "debug"
+	logJSONFlag = true
+	logQuietFlag = true
+	config.LogLevel = "info"
+	config.LogJSON = false
+	config.LogQuiet = false
+
+	rootCmd.PersistentPreRun(rootCmd, []string{})
+
+	if config.LogLevel != "debug" {
+		t.Fatalf("config.LogLevel not updated, got %q", config.LogLevel)
+	}
+	if config.LogJSON != true || config.LogQuiet != true {
+		t.Fatalf("config log flags not updated: json=%v quiet=%v", config.LogJSON, config.LogQuiet)
+	}
+	if app.logger == nil || app.logger.level != LevelDebug || !app.logger.json || !app.logger.quiet {
+		t.Fatalf("logger not initialized as expected: %+v", app.logger)
+	}
+}
+
+func TestServeCmdFlagDefaults(t *testing.T) {
+	flag := serveCmd.Flags().Lookup("shutdown-timeout")
+	if flag == nil {
+		t.Fatalf("serve cmd missing shutdown-timeout flag")
+	}
+	if flag.DefValue != "5s" {
+		t.Fatalf("unexpected default for shutdown-timeout: %q", flag.DefValue)
+	}
+	if addr := serveCmd.Flags().Lookup("addr"); addr == nil {
+		t.Fatalf("serve cmd missing addr flag")
+	} else if addr.DefValue != ":8080" {
+		t.Fatalf("serve addr default mismatch: %q", addr.DefValue)
+	}
+}
+
+func TestCoordsCmdRequiredFlags(t *testing.T) {
+	reqKey := "cobra_annotation_bash_completion_one_required_flag"
+	for _, name := range []string{"lat", "lon"} {
+		f := coordsCmd.Flags().Lookup(name)
+		if f == nil {
+			t.Fatalf("coords flag %q not found", name)
+		}
+		if f.Annotations == nil || f.Annotations[reqKey] == nil || len(f.Annotations[reqKey]) == 0 || f.Annotations[reqKey][0] != "true" {
+			t.Fatalf("coords flag %q should be marked required", name)
+		}
+	}
+	if mode := coordsCmd.Flags().Lookup("mode"); mode == nil || mode.DefValue != "year" {
+		t.Fatalf("coords flag mode default mismatch, got %v", mode)
+	}
+}
+
+func TestCoordsCmdMissingTZ(t *testing.T) {
+	origTZ := coordsTZ
+	defer func() { coordsTZ = origTZ }()
+	coordsTZ = ""
+	err := coordsCmd.RunE(coordsCmd, []string{"Dummy"})
+	if err == nil || !strings.Contains(err.Error(), "--tz 必须指定") {
+		t.Fatalf("expected missing tz error, got %v", err)
+	}
+}
+
+func TestCoordsCmdBadTZ(t *testing.T) {
+	origTZ := coordsTZ
+	origLoad := app.loadTZ
+	defer func() {
+		coordsTZ = origTZ
+		app.loadTZ = origLoad
+	}()
+	coordsTZ = "Bad/Zone"
+	app.loadTZ = func(id string) (*time.Location, error) {
+		return nil, fmt.Errorf("mock tz load fail")
+	}
+	err := coordsCmd.RunE(coordsCmd, []string{})
+	if err == nil || !strings.Contains(err.Error(), "加载时区失败") {
+		t.Fatalf("expected tz load failure, got %v", err)
+	}
+}
+
+func TestDayAndRangeCmdFlagDefaults(t *testing.T) {
+	if f := dayCmd.Flags().Lookup("date"); f == nil {
+		t.Fatalf("dayCmd missing date flag")
+	} else if f.DefValue != "" {
+		t.Fatalf("dayCmd date default should be empty, got %q", f.DefValue)
+	}
+
+	from := rangeCmd.Flags().Lookup("from")
+	to := rangeCmd.Flags().Lookup("to")
+	if from == nil || to == nil {
+		t.Fatalf("rangeCmd missing from/to flags")
+	}
+	if from.DefValue != "" || to.DefValue != "" {
+		t.Fatalf("rangeCmd from/to default should be empty, got %q/%q", from.DefValue, to.DefValue)
+	}
+}
+
+func TestServeCmdRequiredFlagsAnnotations(t *testing.T) {
+	if f := serveCmd.Flags().Lookup("shutdown-timeout"); f == nil {
+		t.Fatalf("serveCmd missing shutdown-timeout flag")
+	} else if f.DefValue != "5s" {
+		t.Fatalf("serveCmd shutdown-timeout default mismatch: %q", f.DefValue)
+	}
+	// No required flags expected on serve; ensure annotations empty.
+	for _, name := range []string{"addr", "shutdown-timeout"} {
+		if f := serveCmd.Flags().Lookup(name); f != nil && f.Annotations != nil {
+			if ann := f.Annotations["cobra_annotation_bash_completion_one_required_flag"]; ann != nil && len(ann) > 0 {
+				t.Fatalf("serve flag %q should not be marked required", name)
+			}
+		}
+	}
+}
+
+func TestPersistentFlagDefaults(t *testing.T) {
+	flags := rootCmd.PersistentFlags()
+	cases := map[string]string{
+		"log-level":     "info",
+		"log-json":      "false",
+		"log-quiet":     "false",
+		"format":        "txt",
+		"offline":       "false",
+		"overwrite":     "false",
+		"outdir":        "",
+		"live":          "false",
+		"live-interval": "5s",
+	}
+	for name, want := range cases {
+		f := flags.Lookup(name)
+		if f == nil {
+			t.Fatalf("persistent flag %q missing", name)
+		}
+		if f.DefValue != want {
+			t.Fatalf("persistent flag %q default mismatch: got %q want %q", name, f.DefValue, want)
+		}
+	}
+}
+
+func TestCoordsCmdModeOptions(t *testing.T) {
+	mode := coordsCmd.Flags().Lookup("mode")
+	if mode == nil {
+		t.Fatalf("coords mode flag missing")
+	}
+	if mode.DefValue != "year" {
+		t.Fatalf("coords mode default mismatch: %q", mode.DefValue)
+	}
+	if allowed := mode.Value.Type(); allowed == "" {
+		t.Fatalf("coords mode Value type should be non-empty")
+	}
+}
+
+func TestDayRangeFlagRequiredCombinations(t *testing.T) {
+	// day date should be optional by default
+	if f := dayCmd.Flags().Lookup("date"); f == nil {
+		t.Fatalf("dayCmd missing date flag")
+	} else {
+		if f.DefValue != "" {
+			t.Fatalf("dayCmd date default should be empty, got %q", f.DefValue)
+		}
+		reqKey := "cobra_annotation_bash_completion_one_required_flag"
+		if f.Annotations == nil || len(f.Annotations[reqKey]) == 0 || f.Annotations[reqKey][0] != "true" {
+			t.Fatalf("dayCmd date flag should be marked required")
+		}
+	}
+
+	// range requires both from/to when used together; flags exist and defaults empty
+	from := rangeCmd.Flags().Lookup("from")
+	to := rangeCmd.Flags().Lookup("to")
+	if from == nil || to == nil {
+		t.Fatalf("rangeCmd missing from/to flags")
+	}
+	if from.DefValue != "" || to.DefValue != "" {
+		t.Fatalf("rangeCmd from/to default should be empty, got %q/%q", from.DefValue, to.DefValue)
+	}
+	reqKey := "cobra_annotation_bash_completion_one_required_flag"
+	for name, f := range map[string]*pflag.Flag{"from": from, "to": to} {
+		if f.Annotations == nil || len(f.Annotations[reqKey]) == 0 || f.Annotations[reqKey][0] != "true" {
+			t.Fatalf("range flag %s should be marked required", name)
+		}
+	}
+}
+
+func TestDayCmdRequiresDate(t *testing.T) {
+	orig := dayDate
+	dayDate = ""
+	defer func() { dayDate = orig }()
+
+	err := dayCmd.RunE(dayCmd, []string{"Beijing"})
+	if err == nil || !strings.Contains(err.Error(), "必须使用 --date") {
+		t.Fatalf("expected missing date error, got %v", err)
+	}
+}
+
+func TestRangeCmdRequiresFromTo(t *testing.T) {
+	origFrom, origTo := rangeFromS, rangeToS
+	rangeFromS, rangeToS = "2025-01-01", ""
+	defer func() {
+		rangeFromS, rangeToS = origFrom, origTo
+	}()
+
+	err := rangeCmd.RunE(rangeCmd, []string{"Beijing"})
+	if err == nil || !strings.Contains(err.Error(), "必须同时指定 --from 和 --to") {
+		t.Fatalf("expected missing to error, got %v", err)
+	}
+}
+
+func TestRangeCmdInvalidDatePair(t *testing.T) {
+	origFrom, origTo := rangeFromS, rangeToS
+	origConfig := *config
+	origCacheTTL := app.cacheTTL
+	origNow := app.now
+	defer func() {
+		rangeFromS, rangeToS = origFrom, origTo
+		*config = origConfig
+		app.cacheTTL = origCacheTTL
+		app.now = origNow
+	}()
+
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	app.cacheTTL = 365 * 24 * time.Hour
+	app.now = func() time.Time { return time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC) }
+	cache := &CityCache{
+		Entries: map[string]CityCacheEntry{
+			"beijing": {
+				City:        "beijing",
+				Normalized:  "beijing",
+				DisplayName: "Beijing",
+				Lat:         39.9,
+				Lon:         116.4,
+				TimezoneID:  "Asia/Shanghai",
+				UpdatedAt:   app.now().Format(time.RFC3339),
+			},
+		},
+	}
+	if err := saveCache(cache); err != nil {
+		t.Fatalf("saveCache failed: %v", err)
+	}
+	config.Offline = true
+	config.OutDir = "" // stay local
+	config.AllowOverwrite = true
+
+	rangeFromS, rangeToS = "bad", "2025-01-02"
+	err := rangeCmd.RunE(rangeCmd, []string{"beijing"})
+	if err == nil || !strings.Contains(err.Error(), "解析起始日期失败") {
+		t.Fatalf("expected parse error for invalid from date, got %v", err)
+	}
+	rangeFromS, rangeToS = "2025-01-03", "2025-01-01"
+	err = rangeCmd.RunE(rangeCmd, []string{"beijing"})
+	if err == nil || !strings.Contains(err.Error(), "结束日期不能早于起始日期") {
+		t.Fatalf("expected order error, got %v", err)
+	}
+}
+
+func TestValidateRangeFlags(t *testing.T) {
+	if err := validateRangeFlags("", "2025-01-02"); err == nil {
+		t.Fatalf("expected error when from missing")
+	}
+	if err := validateRangeFlags("2025-01-01", ""); err == nil {
+		t.Fatalf("expected error when to missing")
+	}
+	if err := validateRangeFlags("2025-01-01", "2025-01-02"); err != nil {
+		t.Fatalf("unexpected error for valid range flags: %v", err)
+	}
+}
+
+func TestPrepareCityOfflineExpiredCache(t *testing.T) {
+	origConfig := *config
+	origTTL := app.cacheTTL
+	origNow := app.now
+	defer func() {
+		*config = origConfig
+		app.cacheTTL = origTTL
+		app.now = origNow
+	}()
+
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	app.cacheTTL = time.Hour
+	app.now = func() time.Time { return time.Date(2025, 1, 3, 0, 0, 0, 0, time.UTC) }
+
+	cache := &CityCache{
+		Entries: map[string]CityCacheEntry{
+			"beijing": {
+				City:        "beijing",
+				Normalized:  "beijing",
+				DisplayName: "Beijing",
+				Lat:         39.9,
+				Lon:         116.4,
+				TimezoneID:  "Asia/Shanghai",
+				UpdatedAt:   app.now().Add(-2 * time.Hour).Format(time.RFC3339), // expired
+			},
+		},
+	}
+	if err := saveCache(cache); err != nil {
+		t.Fatalf("saveCache failed: %v", err)
+	}
+	config.Offline = true
+
+	if _, err := prepareCity("beijing", true); err == nil || !strings.Contains(err.Error(), "缓存已过期") {
+		t.Fatalf("expected offline expired cache error, got %v", err)
+	}
+}
+
+func TestRangeCmdOfflineWithCache(t *testing.T) {
+	origConfig := *config
+	origCacheTTL := app.cacheTTL
+	origNow := app.now
+	origFrom, origTo := rangeFromS, rangeToS
+	defer func() {
+		*config = origConfig
+		app.cacheTTL = origCacheTTL
+		app.now = origNow
+		rangeFromS, rangeToS = origFrom, origTo
+	}()
+
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+
+	// prepare fresh cache entry
+	app.cacheTTL = 365 * 24 * time.Hour
+	app.now = func() time.Time { return time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC) }
+	cache := &CityCache{
+		Entries: map[string]CityCacheEntry{
+			"beijing": {
+				City:        "beijing",
+				Normalized:  "beijing",
+				DisplayName: "Beijing",
+				Lat:         39.9,
+				Lon:         116.4,
+				TimezoneID:  "Asia/Shanghai",
+				UpdatedAt:   app.now().Format(time.RFC3339),
+			},
+		},
+	}
+	if err := saveCache(cache); err != nil {
+		t.Fatalf("saveCache failed: %v", err)
+	}
+
+	config.Offline = true
+	config.OutDir = tmp
+	config.AllowOverwrite = true
+	config.Format = "txt"
+
+	rangeFromS, rangeToS = "2025-01-01", "2025-01-02"
+	if err := rangeCmd.RunE(rangeCmd, []string{"beijing"}); err != nil {
+		t.Fatalf("rangeCmd offline with cache failed: %v", err)
+	}
+	expected := filepath.Join(tmp, "beijing-2025-01-01_to_2025-01-02.txt")
+	if _, err := os.Stat(expected); err != nil {
+		t.Fatalf("expected output file not found: %v", err)
 	}
 }
 
@@ -1154,6 +1969,12 @@ func TestAstroAPIHandlerErrors(t *testing.T) {
 }
 
 func TestPositionsAPIHandlerCoords(t *testing.T) {
+	origNow := app.now
+	app.now = func() time.Time {
+		return time.Date(2025, 1, 1, 12, 0, 0, 0, time.UTC)
+	}
+	defer func() { app.now = origNow }()
+
 	req := httptest.NewRequest("GET", "/api/positions?lat=0&lon=0&tz=UTC", nil)
 	w := httptest.NewRecorder()
 
@@ -1174,6 +1995,15 @@ func TestPositionsAPIHandlerCoords(t *testing.T) {
 	}
 	if parsed.Sun.AzimuthText == "" || parsed.Moon.AzimuthText == "" {
 		t.Errorf("expected non-empty azimuth text, sun=%q moon=%q", parsed.Sun.AzimuthText, parsed.Moon.AzimuthText)
+	}
+	if parsed.Moon.IllumNum < 0 || parsed.Moon.IllumNum > 1 {
+		t.Errorf("illumination_num out of range: %f", parsed.Moon.IllumNum)
+	}
+	if parsed.Moon.Phase < 0 || parsed.Moon.Phase > 1 {
+		t.Errorf("phase out of range: %f", parsed.Moon.Phase)
+	}
+	if !strings.HasSuffix(parsed.Moon.Illumination, "%") {
+		t.Errorf("illumination string should end with %%, got %q", parsed.Moon.Illumination)
 	}
 }
 
@@ -1289,6 +2119,37 @@ func TestBuildFunctionErrors(t *testing.T) {
 	_, _, _, err = buildRangeData(ctx, "2025-01-05", "2025-01-01")
 	if err == nil {
 		t.Error("buildRangeData should return error for end date before start date")
+	}
+}
+
+func TestBuildLivePositionsIncludesPhase(t *testing.T) {
+	loc, _ := time.LoadLocation("UTC")
+	origNow := app.now
+	app.now = func() time.Time {
+		return time.Date(2025, 1, 3, 0, 0, 0, 0, time.UTC)
+	}
+	defer func() { app.now = origNow }()
+
+	ctx := &CityContext{
+		City:        "TestCity",
+		DisplayName: "Test City",
+		Lat:         0,
+		Lon:         0,
+		TZID:        "UTC",
+		Loc:         loc,
+	}
+	resp := buildLivePositions(ctx)
+	if resp.Moon.IllumNum <= 0 || resp.Moon.IllumNum >= 1 {
+		t.Errorf("expected illumination fraction inside (0,1), got %f", resp.Moon.IllumNum)
+	}
+	if resp.Moon.Phase < 0 || resp.Moon.Phase > 1 {
+		t.Errorf("expected phase within [0,1], got %f", resp.Moon.Phase)
+	}
+	if resp.Moon.Illumination == "" {
+		t.Errorf("illumination string should not be empty")
+	}
+	if resp.LocalTime == "" || resp.Generated == "" {
+		t.Errorf("expected LocalTime/Generated filled, got %q %q", resp.LocalTime, resp.Generated)
 	}
 }
 
@@ -1511,6 +2372,28 @@ func TestRunDayWithOutDir(t *testing.T) {
 	expected := filepath.Join(outDir, "TestCity-2025-01-01.json")
 	if _, err := os.Stat(expected); err != nil {
 		t.Errorf("expected output in outdir, file missing: %v", err)
+	}
+}
+
+func TestRunCoordsWritesFile(t *testing.T) {
+	loc := time.FixedZone("UTC", 0)
+	ctx := &CityContext{
+		City:        "coords_0.0000_0.0000",
+		DisplayName: "coords_0.0000_0.0000",
+		Lat:         0,
+		Lon:         0,
+		TZID:        "UTC",
+		Loc:         loc,
+		Now:         time.Date(2025, 1, 2, 12, 0, 0, 0, loc),
+	}
+	tmpDir := t.TempDir()
+	opts := OutputOptions{Format: "json", AllowOverwrite: true, OutDir: tmpDir}
+	if err := runYear(ctx, opts); err != nil {
+		t.Fatalf("runYear for coords failed: %v", err)
+	}
+	p := filepath.Join(tmpDir, "coords_0.0000_0.0000-2025-01-02-year.json")
+	if _, err := os.Stat(p); err != nil {
+		t.Fatalf("expected coords output file missing: %v", err)
 	}
 }
 

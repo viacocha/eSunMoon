@@ -199,6 +199,28 @@ GET /api/positions?lat=39.9&lon=116.4&tz=Asia/Shanghai
 
 ✅ Chart 支持
 
+⸻
+
+🧭 设计概要
+
+- 核心算法：基于 `sunmooncalc` 计算太阳/月亮位置、月相、月出月落；使用 `bradfitz/latlong` 离线时区映射。
+- 数据结构：`CityContext` 持有城市经纬度、时区与当前时间；`dailyAstro` 负责年/日/区间输出，`livePositionsResponse` 用于实时接口。
+- 缓存策略：本地 `~/.esunmoon-cache.json` 保存地理编码结果，带 TTL（默认 100 天）；支持离线模式直接读取缓存。
+- CLI / HTTP 复用：业务核心（year/day/range/live）为函数，CLI 与 HTTP 共用同一套构建逻辑；HTTP 页面实时轮询 `/api/positions`。
+- 容错与回退：未知输出格式回退 txt；位置接口在零/非法刷新间隔时回退默认 5 秒；range 命令要求 from/to 成对。
+
+⸻
+
+🛠 部署与运维
+
+- 二进制部署：直接运行 `esunmoon serve --addr :8080`；后台可用 `systemd`/`supervisor` 托管。
+- 端口与监听：`--addr` 控制监听地址（默认 `:8080`）；`--shutdown-timeout` 控制优雅退出超时（默认 5s）。
+- 健康检查：`GET /healthz`；就绪检查 `GET /readyz`（会校验缓存目录可写）。
+- 日志：`--log-level debug|info|warn|error`，`--log-json` 输出 JSON，`--log-quiet` 静默模式；可重定向 stdout 供采集。
+- 缓存管理：`esunmoon cache list` 查看缓存，`esunmoon cache clear` 清理；离线模式加 `--offline` 只读缓存。
+- 目录与权限：默认缓存 `~/.esunmoon-cache.json`，输出文件在当前目录或 `--outdir`；生产建议将缓存与输出指向持久化卷，并保证进程用户可写。
+- 监控与告警建议：监控进程存活、端口连通、`/readyz` 成功率、日志中的 geocode 失败/缓存过期告警；如需限流可在反向代理层配置。
+
 JSON 的数值字段：
 	•	max_altitude_deg
 	•	daylength_minutes

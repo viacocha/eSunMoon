@@ -610,6 +610,7 @@ func writeAstroFile(format string, allowOverwrite bool, outDir string, cityName 
 	case "excel", "xlsx":
 		return writeAstroExcel(cityName, now, data, desc, baseName+".xlsx", allowOverwrite)
 	default:
+		// 未知格式时回退到 txt，保持行为可预期。
 		return writeAstroTxt(cityName, now, data, desc, baseName+".txt", allowOverwrite)
 	}
 }
@@ -949,6 +950,7 @@ func printSunMoonPosition(ctx *CityContext) {
 // runLivePositions 按指定间隔持续输出实时太阳/月亮位置，直到收到终止信号。
 func runLivePositions(ctx *CityContext, interval time.Duration) error {
 	if interval <= 0 {
+		// 防御非法或零间隔，回退默认 5 秒。
 		interval = 5 * time.Second
 	}
 
@@ -1073,6 +1075,15 @@ func runRange(ctx *CityContext, fromStr, toStr string, opts OutputOptions) error
 		return fmt.Errorf("写入文件失败: %w", err)
 	}
 	logInfof("已生成区间天文数据文件：%s", outFile)
+	return nil
+}
+
+// validateRangeFlags 校验 range 子命令的起止日期参数是否成对提供。
+func validateRangeFlags(fromStr, toStr string) error {
+	// 只要有一端缺失即视为错误，避免运行期再报解析失败。
+	if fromStr == "" || toStr == "" {
+		return fmt.Errorf("必须同时指定 --from 和 --to（格式：YYYY-MM-DD）")
+	}
 	return nil
 }
 
@@ -1320,10 +1331,13 @@ type astroAPIResponse struct {
 }
 
 type bodyPosition struct {
-	AzimuthDeg  float64 `json:"azimuth_deg"`
-	AzimuthText string  `json:"azimuth_text"`
-	AltitudeDeg float64 `json:"altitude_deg"`
-	DistanceKm  float64 `json:"distance_km"`
+	AzimuthDeg   float64 `json:"azimuth_deg"`
+	AzimuthText  string  `json:"azimuth_text"`
+	AltitudeDeg  float64 `json:"altitude_deg"`
+	DistanceKm   float64 `json:"distance_km"`
+	Illumination string  `json:"illumination,omitempty"`
+	IllumNum     float64 `json:"illumination_num,omitempty"`
+	Phase        float64 `json:"phase,omitempty"` // 0=new, 0.25=上弦, 0.5=满月, 0.75=下弦, 1=新月
 }
 
 type livePositionsResponse struct {
@@ -1444,6 +1458,7 @@ func buildLivePositions(ctx *CityContext) livePositionsResponse {
 
 	sunPos := suncalc.GetPosition(now, ctx.Lat, ctx.Lon)
 	moonPos := suncalc.GetMoonPosition(now, ctx.Lat, ctx.Lon)
+	moonIllum := suncalc.GetMoonIllumination(now)
 
 	sunAz := radToDeg(sunPos.Azimuth)
 	sunAlt := radToDeg(sunPos.Altitude)
@@ -1465,10 +1480,13 @@ func buildLivePositions(ctx *CityContext) livePositionsResponse {
 			DistanceKm:  earthSunDistanceKm(now),
 		},
 		Moon: bodyPosition{
-			AzimuthDeg:  moonAz,
-			AzimuthText: describeAzimuth(moonAz),
-			AltitudeDeg: moonAlt,
-			DistanceKm:  moonPos.Distance,
+			AzimuthDeg:   moonAz,
+			AzimuthText:  describeAzimuth(moonAz),
+			AltitudeDeg:  moonAlt,
+			DistanceKm:   moonPos.Distance,
+			Illumination: fmt.Sprintf("%.1f%%", moonIllum.Fraction*100),
+			IllumNum:     moonIllum.Fraction,
+			Phase:        moonIllum.Phase,
 		},
 	}
 }
@@ -1566,6 +1584,9 @@ func positionsPageHandler(w http.ResponseWriter, r *http.Request) {
     .card { background: rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.08); border-radius:20px; padding:18px 18px 22px; box-shadow: 0 26px 68px rgba(0,0,0,0.48); backdrop-filter: blur(8px); }
     h1 { margin:0 0 6px; font-size:25px; letter-spacing: 0.5px; }
     .subtitle { color:#9fb7d8; margin:0 0 14px; font-size:14px; }
+    .nowbar { display:flex; flex-wrap:wrap; align-items:center; gap:10px; margin:6px 0 14px; padding:10px 12px; border-radius:14px; background: linear-gradient(120deg, rgba(72,126,255,0.18), rgba(255,255,255,0.05)); border:1px solid rgba(255,255,255,0.1); box-shadow:0 16px 40px rgba(0,0,0,0.35); font-size:15px; color:#f2f6ff; }
+    .nowbar strong { letter-spacing:0.5px; }
+    .nowbar .lunar { color:#ffd166; font-weight:600; }
     .controls { display:flex; flex-wrap:wrap; gap:12px; align-items:center; margin-bottom:14px; }
     .controls label { font-size:14px; color:#c8dcff; }
     .controls input { padding:6px 8px; border-radius:10px; border:1px solid rgba(255,255,255,0.18); background:rgba(255,255,255,0.06); color:#e4f1ff; }
@@ -1580,6 +1601,10 @@ func positionsPageHandler(w http.ResponseWriter, r *http.Request) {
     .legend span { display:flex; align-items:center; gap:6px; }
     .dot { width:12px; height:12px; border-radius:999px; display:inline-block; }
     .error { color:#ffb4c2; margin-top:8px; }
+    .phaseBox { padding:12px 14px; border-radius:14px; border:1px solid rgba(255,255,255,0.1); background:rgba(255,255,255,0.05); box-shadow:0 14px 32px rgba(0,0,0,0.35); display:flex; align-items:center; gap:12px; }
+    .phaseGlyph { font-size:44px; line-height:1; }
+    .phaseMeta { font-size:13px; color:#d9e6ff; }
+    .phaseMeta strong { display:block; font-size:14px; color:#fff; margin-bottom:2px; }
     a { color:#8ac7ff; }
   </style>
 </head>
@@ -1588,6 +1613,10 @@ func positionsPageHandler(w http.ResponseWriter, r *http.Request) {
     <div class="card">
       <h1>太阳 / 月亮 / 地球 2D 双视图</h1>
       <p class="subtitle">俯视方位盘 + 侧视高度条，一屏同时读方位角与高度角。数据源：/api/positions；默认 30 秒刷新，可调整。</p>
+      <div class="nowbar" id="nowBar" aria-live="polite">
+        <strong>当前时间</strong>
+        <span id="nowText">--</span>
+      </div>
       <div class="controls">
         <div id="cityWrap" style="display:none; gap:8px; align-items:center;">
           <span class="badge">选择城市</span>
@@ -1627,6 +1656,13 @@ func positionsPageHandler(w http.ResponseWriter, r *http.Request) {
       <div class="info">
         <div id="sunInfo"></div>
         <div id="moonInfo"></div>
+        <div id="moonPhaseBox" class="phaseBox" aria-live="polite">
+          <span class="phaseGlyph" id="moonGlyph">🌑</span>
+          <div class="phaseMeta">
+            <strong id="moonPhaseText">月相</strong>
+            <span id="moonPhaseDetail">--</span>
+          </div>
+        </div>
         <div id="ctxInfo"></div>
       </div>
       <div class="error" id="error"></div>
@@ -1654,6 +1690,10 @@ func positionsPageHandler(w http.ResponseWriter, r *http.Request) {
     const altCtx = altCanvas.getContext("2d");
     const cityWrap = document.getElementById("cityWrap");
     const citySelect = document.getElementById("citySelect");
+    const nowText = document.getElementById("nowText");
+    const moonGlyph = document.getElementById("moonGlyph");
+    const moonPhaseText = document.getElementById("moonPhaseText");
+    const moonPhaseDetail = document.getElementById("moonPhaseDetail");
 
     const deg = Math.PI / 180;
     // 原始方位：南=0，东=-90，西=+90，北=±180
@@ -1745,6 +1785,123 @@ func positionsPageHandler(w http.ResponseWriter, r *http.Request) {
       compassCtx.fillText("地球", cx + 10, cy + 4);
     }
 
+    // 农历换算（支持 1900-2100，足够覆盖常规使用）
+    const lunarInfo = [
+      0x04bd8,0x04ae0,0x0a570,0x054d5,0x0d260,0x0d950,0x16554,0x056a0,0x09ad0,0x055d2,
+      0x04ae0,0x0a5b6,0x0a4d0,0x0d250,0x1d255,0x0b540,0x0d6a0,0x0ada2,0x095b0,0x14977,
+      0x04970,0x0a4b0,0x0b4b5,0x06a50,0x06d40,0x1ab54,0x02b60,0x09570,0x052f2,0x04970,
+      0x06566,0x0d4a0,0x0ea50,0x06e95,0x05ad0,0x02b60,0x186e3,0x092e0,0x1c8d7,0x0c950,
+      0x0d4a0,0x1d8a6,0x0b550,0x056a0,0x1a5b4,0x025d0,0x092d0,0x0d2b2,0x0a950,0x0b557,
+      0x06ca0,0x0b550,0x15355,0x04da0,0x0a5d0,0x14573,0x052d0,0x0a9a8,0x0e950,0x06aa0,
+      0x0aea6,0x0ab50,0x04b60,0x0aae4,0x0a570,0x05260,0x0f263,0x0d950,0x05b57,0x056a0,
+      0x096d0,0x04dd5,0x04ad0,0x0a4d0,0x0d4d4,0x0d250,0x0d558,0x0b540,0x0b6a0,0x195a6,
+      0x095b0,0x049b0,0x0a974,0x0a4b0,0x0b27a,0x06a50,0x06d40,0x0af46,0x0ab60,0x09570,
+      0x04af5,0x04970,0x064b0,0x074a3,0x0ea50,0x06b58,0x05ac0,0x0ab60,0x096d5,0x092e0,
+      0x0c960,0x0d954,0x0d4a0,0x0da50,0x07552,0x056a0,0x0abb7,0x025d0,0x092d0,0x0cab5,
+      0x0a950,0x0b4a0,0x0baa4,0x0ad50,0x055d9,0x04ba0,0x0a5b0,0x15176,0x052b0,0x0a930,
+      0x07954,0x06aa0,0x0ad50,0x05b52,0x04b60,0x0a6e6,0x0a4e0,0x0d260,0x0ea65,0x0d530,
+      0x05aa0,0x076a3,0x096d0,0x04bd7,0x04ad0,0x0a4d0,0x1d0b6,0x0d250,0x0d520,0x0dd45,
+      0x0b5a0,0x056d0,0x055b2,0x049b0,0x0a577,0x0a4b0,0x0aa50,0x1b255,0x06d20,0x0ada0,
+      0x14b63,0x09370,0x049f8,0x04970,0x064b0,0x168a6,0x0ea50,0x06b20,0x1a6c4,0x0aae0,
+      0x0a2e0,0x0d2e3,0x0c960,0x0d557,0x0d4a0,0x0da50,0x05d55,0x056a0,0x0a6d0,0x055d4,
+      0x052d0,0x0a9b8,0x0a950,0x0b4a0,0x0b6a6,0x0ad50,0x055a0,0x0aba4,0x0a5b0,0x052b0,
+      0x0b273,0x06930,0x07337,0x06aa0,0x0ad50,0x14b55,0x04b60,0x0a570,0x054e4,0x0d160,
+      0x0e968,0x0d520,0x0daa0,0x16aa6,0x056d0,0x04ae0,0x0a9d4,0x0a2d0,0x0d150,0x0f252,
+      0x0d520
+    ];
+
+    function leapMonth(y) {
+      return lunarInfo[y - 1900] & 0xf;
+    }
+    function leapDays(y) {
+      const lm = leapMonth(y);
+      if (lm === 0) return 0;
+      return (lunarInfo[y - 1900] & 0x10000) ? 30 : 29;
+    }
+    function monthDays(y, m) {
+      return (lunarInfo[y - 1900] & (0x10000 >> m)) ? 30 : 29;
+    }
+    function lYearDays(y) {
+      let sum = 348;
+      for (let i = 0x8000; i > 0x8; i >>= 1) {
+        sum += (lunarInfo[y - 1900] & i) ? 1 : 0;
+      }
+      return sum + leapDays(y);
+    }
+    function solarToLunar(y, m, d) {
+      const baseDate = new Date(1900, 0, 31);
+      const target = new Date(y, m - 1, d);
+      let offset = Math.floor((target.getTime() - baseDate.getTime()) / 86400000);
+      let i, temp, leap, isLeap = false;
+      for (i = 1900; i < 2101 && offset > 0; i++) {
+        temp = lYearDays(i);
+        offset -= temp;
+      }
+      if (offset < 0) {
+        offset += temp;
+        i--;
+      }
+      const lunarYear = i;
+      leap = leapMonth(lunarYear);
+      for (i = 1; i < 13 && offset >= 0; i++) {
+        if (leap > 0 && i === (leap + 1) && !isLeap) {
+          --i;
+          isLeap = true;
+          temp = leapDays(lunarYear);
+        } else {
+          temp = monthDays(lunarYear, i);
+        }
+        if (isLeap && i === (leap + 1)) {
+          isLeap = false;
+        }
+        offset -= temp;
+      }
+      if (offset < 0) {
+        offset += temp;
+        i--;
+      }
+      const lunarMonth = i;
+      const lunarDay = offset + 1;
+      return { year: lunarYear, month: lunarMonth, day: lunarDay, isLeap };
+    }
+    function lunarToStr(lunar) {
+      const monthNames = ["正月","二月","三月","四月","五月","六月","七月","八月","九月","十月","冬月","腊月"];
+      const dayNames = ["初一","初二","初三","初四","初五","初六","初七","初八","初九","初十","十一","十二","十三","十四","十五","十六","十七","十八","十九","二十","廿一","廿二","廿三","廿四","廿五","廿六","廿七","廿八","廿九","三十"];
+      const mStr = lunar.isLeap ? "闰" + monthNames[(lunar.month || 1) - 1] : monthNames[(lunar.month || 1) - 1];
+      const dStr = dayNames[(lunar.day || 1) - 1] || "";
+      return mStr + dStr;
+    }
+
+    function phaseToGlyph(phase) {
+      // 8 阶梯：新月、娥眉月、上弦月、盈凸月、满月、亏凸月、下弦月、残月
+      const glyphs = ["🌑","🌒","🌓","🌔","🌕","🌖","🌗","🌘"];
+      if (typeof phase !== "number" || isNaN(phase)) return glyphs[0];
+      const idx = Math.round(((phase %% 1) + 1) %% 1 * 8) %% 8;
+      return glyphs[idx];
+    }
+
+    function renderMoonPhase(moon) {
+      if (!moon) return;
+      const phase = typeof moon.phase === "number" ? moon.phase : null;
+      const illum = typeof moon.illumination_num === "number" ? moon.illumination_num : null;
+      const glyph = phaseToGlyph(phase || 0);
+      if (moonGlyph) moonGlyph.textContent = glyph;
+      const pct = illum !== null ? (illum * 100).toFixed(1) + "%%" : (moon.illumination || "--");
+      let label = "月相";
+      if (phase !== null) {
+        if (phase < 0.03 || phase > 0.97) label = "新月";
+        else if (phase < 0.22) label = "峨眉月";
+        else if (phase < 0.28) label = "上弦月";
+        else if (phase < 0.47) label = "盈凸月";
+        else if (phase < 0.53) label = "满月";
+        else if (phase < 0.72) label = "亏凸月";
+        else if (phase < 0.78) label = "下弦月";
+        else label = "残月";
+      }
+      if (moonPhaseText) moonPhaseText.textContent = label;
+      if (moonPhaseDetail) moonPhaseDetail.textContent = "光照比例 " + pct + (phase !== null ? " · 周期位置 " + phase.toFixed(3) : "");
+    }
+
     function drawTrackCompass(track, r, color, cx, cy) {
       if (track.length < 2) return;
       const rgb = hexToRgb(color);
@@ -1824,6 +1981,27 @@ func positionsPageHandler(w http.ResponseWriter, r *http.Request) {
       compassCtx.fillText(labelText, x + dx, y + dy);
       compassCtx.textAlign = "left";
       compassCtx.textBaseline = "alphabetic";
+    }
+
+    function getLocalYMD(dateObj, tz) {
+      const parts = new Intl.DateTimeFormat("en-CA", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(dateObj);
+      const map = {};
+      parts.forEach(p => { map[p.type] = p.value; });
+      return {
+        year: parseInt(map.year, 10),
+        month: parseInt(map.month, 10),
+        day: parseInt(map.day, 10),
+      };
+    }
+
+    function renderNowBar(data) {
+      if (!data || !data.generated_at || !data.timezone) return;
+      const nowDate = new Date(data.generated_at);
+      const ymd = getLocalYMD(nowDate, data.timezone);
+      const lunar = solarToLunar(ymd.year, ymd.month, ymd.day);
+      const dateStr = new Intl.DateTimeFormat("zh-CN", { timeZone: data.timezone, year: "numeric", month: "2-digit", day: "2-digit", weekday: "short" }).format(nowDate);
+      const timeStr = new Intl.DateTimeFormat("zh-CN", { timeZone: data.timezone, hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" }).format(nowDate);
+      nowText.textContent = dateStr + "（农历" + lunarToStr(lunar) + "） " + timeStr + " " + data.timezone;
     }
 
     function drawAltitudeView(data, baseR, sunTrackData, moonTrackData) {
@@ -2006,9 +2184,12 @@ func positionsPageHandler(w http.ResponseWriter, r *http.Request) {
     function setInfo(data) {
       const sun = data.sun;
       const moon = data.moon;
+      const moonIllum = moon.illumination || (typeof moon.illumination_num === "number" ? (moon.illumination_num * 100).toFixed(1) + "%%" : "--");
       document.getElementById("sunInfo").innerHTML = "<strong>太阳</strong><br>方位角: " + sun.azimuth_deg.toFixed(2) + "° (" + sun.azimuth_text + ")<br>高度角: " + sun.altitude_deg.toFixed(2) + "°<br>地日距离: " + sun.distance_km.toFixed(0) + " km";
-      document.getElementById("moonInfo").innerHTML = "<strong>月亮</strong><br>方位角: " + moon.azimuth_deg.toFixed(2) + "° (" + moon.azimuth_text + ")<br>高度角: " + moon.altitude_deg.toFixed(2) + "°<br>地月距离: " + moon.distance_km.toFixed(0) + " km";
+      document.getElementById("moonInfo").innerHTML = "<strong>月亮</strong><br>方位角: " + moon.azimuth_deg.toFixed(2) + "° (" + moon.azimuth_text + ")<br>高度角: " + moon.altitude_deg.toFixed(2) + "°<br>地月距离: " + moon.distance_km.toFixed(0) + " km<br>可见光比例: " + moonIllum;
       document.getElementById("ctxInfo").innerHTML = "<strong>定位</strong><br>城市: " + data.display + "<br>坐标: " + data.lat.toFixed(4) + ", " + data.lon.toFixed(4) + "<br>时区: " + data.timezone + "<br>当地时间: " + data.local_time;
+      renderNowBar(data);
+      renderMoonPhase(moon);
     }
 
     function buildApiUrl() {
@@ -2394,8 +2575,8 @@ var rangeCmd = &cobra.Command{
 	Short: "指定日期区间的天文数据",
 	Args:  cobra.ArbitraryArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		if rangeFromS == "" || rangeToS == "" {
-			return fmt.Errorf("必须同时指定 --from 和 --to（格式：YYYY-MM-DD）")
+		if err := validateRangeFlags(rangeFromS, rangeToS); err != nil {
+			return err
 		}
 		city := getCityFromArgsOrPrompt(args)
 		if city == "" {
@@ -2618,6 +2799,9 @@ func init() {
 	dayCmd.Flags().StringVarP(&dayDate, "date", "d", "", "指定日期（格式：YYYY-MM-DD）")
 	rangeCmd.Flags().StringVar(&rangeFromS, "from", "", "起始日期（格式：YYYY-MM-DD）")
 	rangeCmd.Flags().StringVar(&rangeToS, "to", "", "结束日期（格式：YYYY-MM-DD）")
+	_ = dayCmd.MarkFlagRequired("date")
+	_ = rangeCmd.MarkFlagRequired("from")
+	_ = rangeCmd.MarkFlagRequired("to")
 
 	cacheClearCmd.Flags().BoolVarP(&cacheForce, "yes", "y", false, "不询问直接清空缓存")
 
